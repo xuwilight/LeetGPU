@@ -1,12 +1,14 @@
+#include <cmath>
+#include <vector>
 #include <cuda_runtime.h>
-
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
-#include <vector>
-#include <cmath>
 
+__device__ __forceinline__ float4 add_float4(float4 a, float4 b)
+{
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
 
-// base
 __global__ void vector_add1(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -16,7 +18,6 @@ __global__ void vector_add1(const float *__restrict__ A, const float *__restrict
     }
 }
 
-// float4
 template <int stride = 4>
 __global__ void vector_add2(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
@@ -27,33 +28,88 @@ __global__ void vector_add2(const float *__restrict__ A, const float *__restrict
     float4 a, b, c;
     if (offset + 3 < N)
     {
-        a = reinterpret_cast<const float4 *>(A + index)[tid];
-        b = reinterpret_cast<const float4 *>(B + index)[tid];
-        c.x = a.x + b.x;
-        c.y = a.y + b.y;
-        c.z = a.z + b.z;
-        c.w = a.w + b.w;
+        a = __ldg(reinterpret_cast<const float4 *>(A + index) + tid);
+        b = __ldg(reinterpret_cast<const float4 *>(B + index) + tid);
+        c = add_float4(a, b);
         reinterpret_cast<float4 *>(C + index)[tid] = c;
     }
     else
     {
         for (int i = 0; i < 4 && (offset + i) < N; ++i)
         {
-            C[offset + i] = A[offset + i] + B[offset + i];
+            C[offset + i] = __ldg(A + offset + i) + __ldg(B + offset + i);
+        }
+    }
+}
+
+template <int STRIDE, int UNROLL>
+__global__ void vector_add3(
+    const float *__restrict__ A,
+    const float *__restrict__ B,
+    float *__restrict__ C,
+    int N)
+{
+    const float4 *A4 = reinterpret_cast<const float4 *>(A);
+    const float4 *B4 = reinterpret_cast<const float4 *>(B);
+    float4 *C4 = reinterpret_cast<float4 *>(C);
+
+    size_t vec_n = N / 4;
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float4 a_reg[UNROLL];
+    float4 b_reg[UNROLL];
+    float4 c_reg[UNROLL];
+
+    size_t i = idx;
+    for (; i + STRIDE * (UNROLL - 1) < vec_n; i += STRIDE * UNROLL)
+    {
+#pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+        {
+            a_reg[u] = __ldg(A4 + i + u * STRIDE);
+            b_reg[u] = __ldg(B4 + i + u * STRIDE);
+            c_reg[u] = add_float4(a_reg[u], b_reg[u]);
+            C4[i + u * STRIDE] = c_reg[u];
+        }
+    }
+
+    for (; i < vec_n; i += STRIDE)
+    {
+        float4 a = __ldg(A4 + i);
+        float4 b = __ldg(B4 + i);
+        C4[i] = add_float4(a, b);
+    }
+
+    if (blockIdx.x == 0)
+    {
+        size_t remainder_start = vec_n * 4;
+        for (size_t k = remainder_start + threadIdx.x; k < N; k += blockDim.x)
+        {
+            C[k] = A[k] + B[k];
         }
     }
 }
 
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
-void solve(const float *A, const float *B, float *C, int N)
+extern "C" void solve(const float *A, const float *B, float *C, int N)
 {
     constexpr int stride = 4;
-    constexpr int unroll = 1;
-    constexpr int stage = 1;
     int threadsPerBlock = 256;
-    int blocksPerGrid = (N + threadsPerBlock * stride * unroll * stage - 1) / (threadsPerBlock * stride * unroll * stage);
+    int blocksPerGrid = (N + threadsPerBlock * stride - 1) / (threadsPerBlock * stride);
+    vector_add2<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
 
-    vector_add2<stride, unroll, stage><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
+    cudaDeviceSynchronize();
+}
+
+// A, B, C are device pointers (i.e. pointers to memory on the GPU)
+extern "C" void solve1(const float *A, const float *B, float *C, int N)
+{
+    constexpr int threadsPerBlock = 256;
+    constexpr int blocksPerGrid = 132 * 64; // 132 SMs * 64 Blocks
+    constexpr int UNROLL = 4;
+    constexpr int STRIDE = blocksPerGrid * threadsPerBlock;
+    vector_add3<STRIDE, UNROLL><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
+
     cudaDeviceSynchronize();
 }
 
@@ -71,6 +127,7 @@ void validate(float *a, float *b, float *c, int N)
     printf("calculate correct\n");
 }
 
+// nvcc -O3 vector_add.cu -o vector_add
 int main()
 {
     srand(2333);
