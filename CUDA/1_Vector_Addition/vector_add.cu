@@ -1,8 +1,8 @@
 #include <cmath>
-#include <vector>
 #include <cuda_runtime.h>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <vector>
 
 __device__ __forceinline__ float4 add_float4(float4 a, float4 b)
 {
@@ -18,7 +18,7 @@ __global__ void vector_add1(const float *__restrict__ A, const float *__restrict
     }
 }
 
-template <int stride = 4>
+template <int stride = 4, int unroll = 4>
 __global__ void vector_add2(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
     const int tid = threadIdx.x;
@@ -42,12 +42,37 @@ __global__ void vector_add2(const float *__restrict__ A, const float *__restrict
     }
 }
 
+template <int stride = 4, int unroll = 4>
+__global__ void vector_add3(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
+{
+    const int tid = threadIdx.x;
+    const int block_offset = blockIdx.x * blockDim.x * unroll * stride;
+    const int base_idx = block_offset + tid * stride;
+
+#pragma unroll
+    for (int u = 0; u < unroll; ++u)
+    {
+        int offset = base_idx + u * blockDim.x * stride;
+        if (offset + 3 < N)
+        {
+            float4 a = __ldg(reinterpret_cast<const float4 *>(A + offset));
+            float4 b = __ldg(reinterpret_cast<const float4 *>(B + offset));
+            float4 c = add_float4(a, b);
+            *reinterpret_cast<float4 *>(C + offset) = c;
+        }
+        else
+        {
+            for (int i = 0; i < 4 && (offset + i) < N; ++i)
+            {
+                C[offset + i] = A[offset + i] + B[offset + i];
+            }
+        }
+    }
+}
+
+
 template <int STRIDE, int UNROLL>
-__global__ void vector_add3(
-    const float *__restrict__ A,
-    const float *__restrict__ B,
-    float *__restrict__ C,
-    int N)
+__global__ void vector_add4(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
     const float4 *A4 = reinterpret_cast<const float4 *>(A);
     const float4 *B4 = reinterpret_cast<const float4 *>(B);
@@ -94,9 +119,10 @@ __global__ void vector_add3(
 extern "C" void solve(const float *A, const float *B, float *C, int N)
 {
     constexpr int stride = 4;
+    constexpr int unroll = 4;
     int threadsPerBlock = 256;
-    int blocksPerGrid = (N + threadsPerBlock * stride - 1) / (threadsPerBlock * stride);
-    vector_add2<<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
+    int blocksPerGrid = (N + threadsPerBlock * stride * unroll- 1) / (threadsPerBlock * stride * unroll);
+    vector_add3<stride, unroll><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
 
     cudaDeviceSynchronize();
 }
@@ -105,7 +131,7 @@ extern "C" void solve(const float *A, const float *B, float *C, int N)
 extern "C" void solve1(const float *A, const float *B, float *C, int N)
 {
     constexpr int threadsPerBlock = 256;
-    constexpr int blocksPerGrid = 132 * 64; // 132 SMs * 64 Blocks
+    constexpr int blocksPerGrid = 132 * 8; // 132 SMs * 8 Blocks
     constexpr int UNROLL = 4;
     constexpr int STRIDE = blocksPerGrid * threadsPerBlock;
     vector_add3<STRIDE, UNROLL><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
@@ -149,6 +175,7 @@ int main()
     thrust::device_vector<float> out_d = output;
 
     solve(in_d1.data().get(), in_d2.data().get(), out_d.data().get(), N);
+    // solve1(in_d1.data().get(), in_d2.data().get(), out_d.data().get(), N);
 
     int benchmark = 1;
 
