@@ -51,12 +51,9 @@ __global__ void sgemm_v1(T *A, T *B, float *C, int M, int N, int K)
 /**
  * 1. shared memory blocks.
  * bM * bN * bK = 64 * 64 * 64,   threads = 128, num_warps = 4.
- * bM * bN * bK = 128 * 128 * 64, threads = 256, num_warps = 8.
  * 2. thread tile
  * one thread takes 8 values in M, 4 values in N.
- * one thread takes 8 values in M, 8 values in N.
  * 3. warp tile
- * one warp takes 8 threads in M, 4 threads in N.
  * one warp takes 8 threads in M, 4 threads in N.
  */
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
