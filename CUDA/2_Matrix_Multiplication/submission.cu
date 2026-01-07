@@ -52,6 +52,120 @@ __global__ void sgemm_base(const T *A, const T *B, float *C, int M, int N, int K
     }
 }
 
+/**
+ * Block Size: 64x64x64
+ * Threads: 128 (4 Warps)
+ *
+ * A (M×K) is row-major, B (K×N) is row-major.
+ *
+ * 1. Block Tile: 64x64 (Computed by 1 CTA)
+ * 2. Warp Tile:  32x32   (Computed by 1 Warp) -> Layout: 2x2 Warps
+ * 3. Thread Tile:  4x8   (Computed by 1 Thread) -> Layout within Warp: 8x4 Threads
+ */
+template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
+__global__ void sgemm_v2(T *A, T *B, float *C, int M, int N, int K)
+{
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    const int m_val = 4; // m_val per thread in M
+    const int n_val = 8; // n_val per thread in N
+
+    // warp tile
+    const int warp_row = warp_id / 2;
+    const int warp_col = warp_id % 2;
+
+    // thread tile
+    const int tid_row_in_warp = lane_id / 4;
+    const int tid_col_in_warp = lane_id % 4;
+
+    // The starting row (M) and col (N) for this thread's result tile
+    const int row_offset = warp_row * 32 + tid_row_in_warp * m_val;
+    const int col_offset = warp_col * 32 + tid_col_in_warp * n_val;
+
+    int x = blockIdx.x;
+    int y = blockIdx.y;
+
+    auto gA = A + x * bM * K;
+    auto gB = B + y * bN * K;
+    auto gC = C + x * bM * N + y * bN;
+
+    __shared__ T sA[bM * bK];
+    __shared__ T sB[bN * bK];
+
+#pragma unroll
+    for (int i = tid; i < bM * bK; i += NumThreads)
+    {
+        sA[i] = 0;
+    }
+#pragma unroll
+    for (int i = tid; i < bN * bK; i += NumThreads)
+    {
+        sB[i] = 0;
+    }
+    __syncthreads();
+
+    float reg_c[m_val * n_val] = {0.0f};
+    float reg_a[m_val];
+    float reg_b[n_val];
+
+    int numK = K / bK;
+
+    for (int k = 0; k < numK; ++k)
+    {
+        // copy A into sA, K-major, sA is 64 * 64
+        auto sAgA = gA + k * bK;
+        reinterpret_cast<float4 *>(sA + tid * bK)[0] = reinterpret_cast<float4 *>(sAgA + tid * K)[0];
+        reinterpret_cast<float4 *>(sA + tid * bK)[1] = reinterpret_cast<float4 *>(sAgA + tid * K)[1];
+
+        // copy B into sB, N-major
+        auto sBgB = gB + k * bK;
+        reinterpret_cast<float4 *>(sB + tid * bK)[0] = reinterpret_cast<float4 *>(sBgB + tid * K)[0];
+        reinterpret_cast<float4 *>(sB + tid * bK)[1] = reinterpret_cast<float4 *>(sBgB + tid * K)[1];
+
+        __syncthreads();
+
+#pragma unroll
+        for (int tk = 0; tk < bK; ++tk)
+        {
+            // 1. Load A fragments into registers
+            for (int i = 0; i < m_val; ++i)
+            {
+                reg_a[i] = sA[(row_offset + i) * bK + tk];
+            }
+
+            // 2. Load B fragments into registers
+            for (int j = 0; j < n_val; ++j)
+            {
+                reg_b[j] = sB[(col_offset + j) * bK + tk];
+            }
+
+            // 3. Compute Outer Product
+            for (int i = 0; i < m_val; ++i)
+            {
+                for (int j = 0; j < n_val; ++j)
+                {
+                    reg_c[i * n_val + j] += reg_a[i] * reg_b[j];
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < m_val; ++i)
+    {
+        int global_row = row_offset + i;
+#pragma unroll
+        for (int j = 0; j < n_val; ++j)
+        {
+            int global_col = col_offset + j;
+            gC[global_row * N + global_col] = reg_c[i * n_val + j];
+        }
+    }
+}
+
 template <int N>
 __device__ void cp_async_wait()
 {
