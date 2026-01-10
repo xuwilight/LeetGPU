@@ -56,14 +56,14 @@ __global__ void sgemm_v1(const T *A, const T *B, float *C, int M, int N, int K)
 }
 
 /**
- * Block Size: 64x64x32
+ * Block Size: 128x64x32
  * Threads: 128 (4 Warps)
  *
  * A (M×K) is row-major, B (K×N) is row-major
  *
- * 1. Block Tile: 64x64 (Computed by 1 CTA)
- * 2. Warp Tile:  32x32   (Computed by 1 Warp) -> Layout: 2x2 Warps
- * 3. Thread Tile:  4x8   (Computed by 1 Thread) -> Layout within Warp: 8x4 Threads
+ * 1. Block Tile: 128x64 (Computed by 1 CTA)
+ * 2. Warp Tile:  64x32   (Computed by 1 Warp) -> Layout: 2x2 Warps
+ * 3. Thread Tile:  8x8   (Computed by 1 Thread) -> Layout within Warp: 8x4 Threads
  */
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
 __global__ void sgemm_v2(const T *A, const T *B, float *C, int M, int N, int K)
@@ -72,7 +72,7 @@ __global__ void sgemm_v2(const T *A, const T *B, float *C, int M, int N, int K)
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    const int m_val = 4; // m_val per thread in M
+    const int m_val = 8; // m_val per thread in M
     const int n_val = 8; // n_val per thread in N
 
     // warp tile
@@ -84,7 +84,7 @@ __global__ void sgemm_v2(const T *A, const T *B, float *C, int M, int N, int K)
     const int tid_col_in_warp = lane_id % 4;
 
     // The starting row (M) and col (N) for this thread's result tile
-    const int row_offset = warp_row * 32 + tid_row_in_warp * m_val;
+    const int row_offset = warp_row * 64 + tid_row_in_warp * m_val;
     const int col_offset = warp_col * 32 + tid_col_in_warp * n_val;
 
     int x = blockIdx.x;
@@ -204,7 +204,7 @@ __global__ void sgemm_v3(const T *A, const T *B, float *C, int M, int N, int K)
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    const int m_val = 4; // m_val per thread in M
+    const int m_val = 8; // m_val per thread in M
     const int n_val = 8; // n_val per thread in N
 
     // warp tile
@@ -216,7 +216,7 @@ __global__ void sgemm_v3(const T *A, const T *B, float *C, int M, int N, int K)
     const int tid_col_in_warp = lane_id % 4;
 
     // The starting row (M) and col (N) for this thread's result tile
-    const int row_offset = warp_row * 32 + tid_row_in_warp * m_val;
+    const int row_offset = warp_row * 64 + tid_row_in_warp * m_val;
     const int col_offset = warp_col * 32 + tid_col_in_warp * n_val;
 
     // thread block swizzle
@@ -347,14 +347,15 @@ __device__ void cp_async_size16(T *smem, const T *gmem)
  * 2. multi-stages
  */
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
-__global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
+__global__ void
+sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    const int m_val = 4; // m_val per thread in M
-    const int n_val = 8; // n_val per thread in N
+    constexpr int m_val = 8; // m_val per thread in M
+    constexpr int n_val = 8; // n_val per thread in N
 
     // warp tile
     const int warp_row = warp_id / 2;
@@ -365,7 +366,7 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
     const int tid_col_in_warp = lane_id % 4;
 
     // The starting row (M) and col (N) for this thread's result tile
-    const int row_offset = warp_row * 32 + tid_row_in_warp * m_val;
+    const int row_offset = warp_row * 64 + tid_row_in_warp * m_val;
     const int col_offset = warp_col * 32 + tid_col_in_warp * n_val;
 
     // thread block swizzle
@@ -383,12 +384,15 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
     T *sB = shared_memory + bM * bK * NumPipe;
 
     float reg_c[m_val * n_val] = {0.0f};
-    float reg_a[m_val * bK];
-    float reg_b[n_val * bK];
+    float reg_a[m_val * 2]; // bK contiguous
+    float reg_b[n_val * 2]; // bN contiguous
 
     int numK = (K + bK - 1) / bK;
     int k_tile_count = numK;
     int k_tile_next = 0;
+
+    constexpr int nbK = bK / 4;
+    constexpr int nbN = bN / 4;
 
     // prefetch
     for (int k_pipe = 0; k_pipe < NumPipe - 1; ++k_pipe)
@@ -397,12 +401,11 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
         auto tile_sA = sA + k_pipe * bM * bK;
 
         // copy A into sA, K-major
-        int n_tid_col = bK / 4; // use float4
 #pragma unroll
-        for (int i = tid; i < bM * n_tid_col; i += NumThreads)
+        for (int i = tid; i < bM * nbK; i += NumThreads)
         {
-            int row = i / n_tid_col;
-            int col = i % n_tid_col;
+            int row = i / nbK;
+            int col = i % nbK;
 
             int logical_row = (row / m_val) % 8;
             int swizzle_col = logical_row ^ col; // logical_row xor col
@@ -416,12 +419,11 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
         auto tile_sB = sB + k_pipe * bN * bK;
 
         // copy B into sB, N-major
-        n_tid_col = bN / 4; // use float4
 #pragma unroll
-        for (int i = tid; i < n_tid_col * bK; i += NumThreads)
+        for (int i = tid; i < nbN * bK; i += NumThreads)
         {
-            int row = i / n_tid_col;
-            int col = i % n_tid_col;
+            int row = i / nbN;
+            int col = i % nbN;
 
             int global_row = k_tile_next * bK + row;
             auto smem_ptr = reinterpret_cast<float4 *>(tile_sB + row * bN) + col;
@@ -452,13 +454,13 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
     for (int i = 0; i < m_val; ++i)
     {
         int logical_row = ((row_offset + i) / m_val) % 8;
-        int logical_col = logical_row ^ (0 / 4);
-        reg_a[i + 0 * m_val] = tile_sA[(row_offset + i) * bK + logical_col * 4 + 0 % 4];
+        int logical_col = logical_row ^ 0; // the 0th col
+        reg_a[i * 2 + 0] = tile_sA[(row_offset + i) * bK + logical_col * 4 + 0];
     }
 #pragma unroll
-    for (int j = 0; j < n_val; ++j)
+    for (int j = 0; j < 2; ++j) // n_val / 4 = 2
     {
-        reg_b[j + 0 * n_val] = tile_sB[0 * bN + col_offset + j];
+        reinterpret_cast<float4 *>(reg_b)[0 * 2 + j] = reinterpret_cast<float4 *>(tile_sB + 0 * bN + col_offset)[j];
     }
 
     while (k_tile_count > -(NumPipe - 1))
@@ -474,18 +476,28 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
                 __syncthreads();
             }
 
+#pragma unroll
+            for (int i = 0; i < m_val; ++i)
+            {
+#pragma unroll
+                for (int j = 0; j < n_val; ++j)
+                {
+                    reg_c[i * n_val + j] += reg_a[i * 2 + (tk % 2)] * reg_b[j + (tk % 2) * n_val];
+                }
+            }
+
             int tk_next = (tk + 1) % bK;
 #pragma unroll
             for (int i = 0; i < m_val; ++i)
             {
                 int logical_row = ((row_offset + i) / m_val) % 8;
                 int logical_col = logical_row ^ (tk_next / 4);
-                reg_a[i + tk_next * m_val] = tile_sA[(row_offset + i) * bK + logical_col * 4 + tk_next % 4];
+                reg_a[i * 2 + (tk_next % 2)] = tile_sA[(row_offset + i) * bK + logical_col * 4 + tk_next % 4];
             }
 #pragma unroll
-            for (int j = 0; j < n_val; ++j)
+            for (int j = 0; j < 2; ++j)
             {
-                reg_b[j + tk_next * n_val] = tile_sB[tk_next * bN + col_offset + j];
+                reinterpret_cast<float4 *>(reg_b)[(tk_next % 2) * 2 + j] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN + col_offset)[j];
             }
 
             if (tk == 0)
@@ -493,12 +505,11 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
                 // load from gmem to smem buffer
                 auto tile_gA = gA + k_tile_next * bK;
                 auto tile_sA = sA + smem_pipe_write * bM * bK;
-                int n_tid_col = bK / 4; // use float4
 #pragma unroll
-                for (int i = tid; i < bM * n_tid_col; i += NumThreads)
+                for (int i = tid; i < bM * nbK; i += NumThreads)
                 {
-                    int row = i / n_tid_col;
-                    int col = i % n_tid_col;
+                    int row = i / nbK;
+                    int col = i % nbK;
 
                     int logical_row = (row / m_val) % 8;
                     int swizzle_col = logical_row ^ col; // logical_row xor col
@@ -509,12 +520,11 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
 
                 auto tile_gB = gB;
                 auto tile_sB = sB + smem_pipe_write * bN * bK;
-                n_tid_col = bN / 4; // use float4
 #pragma unroll
-                for (int i = tid; i < n_tid_col * bK; i += NumThreads)
+                for (int i = tid; i < nbN * bK; i += NumThreads)
                 {
-                    int row = i / n_tid_col;
-                    int col = i % n_tid_col;
+                    int row = i / nbN;
+                    int col = i % nbN;
 
                     int global_row = k_tile_next * bK + row;
                     auto smem_ptr = reinterpret_cast<float4 *>(tile_sB + row * bN) + col;
@@ -531,14 +541,6 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
                 smem_pipe_write = smem_pipe_read;
                 smem_pipe_read = (smem_pipe_read == NumPipe - 1) ? 0 : smem_pipe_read + 1;
             }
-
-            for (int i = 0; i < m_val; ++i)
-            {
-                for (int j = 0; j < n_val; ++j)
-                {
-                    reg_c[i * n_val + j] += reg_a[i + tk * m_val] * reg_b[j + tk * n_val];
-                }
-            }
         }
     }
 
@@ -550,17 +552,17 @@ __global__ void sgemm_v4(const T *A, const T *B, float *C, int M, int N, int K)
         for (int j = 0; j < n_val; ++j)
         {
             int local_col = col_offset + j;
+            // gC[local_row * N + local_col] = reg_c[i * n_val + j];
             shared_memory[local_row * bN + local_col] = reg_c[i * n_val + j]; // reuse shared memory
         }
     }
     __syncthreads();
 
-    int n_tid_col = bN / 4; // use float4
 #pragma unroll
-    for (int i = tid; i < bM * n_tid_col; i += NumThreads)
+    for (int i = tid; i < bM * nbN; i += NumThreads)
     {
-        int row = i / n_tid_col;
-        int col = i % n_tid_col;
+        int row = i / nbN;
+        int col = i % nbN;
         reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * bN)[col];
     }
 }
@@ -574,7 +576,7 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
     // N = temp;
     // M = M;
 
-    constexpr int blockM = 64;
+    constexpr int blockM = 128;
     constexpr int blockN = 64;
     constexpr int blockK = 32;
     using T = float;
@@ -667,7 +669,7 @@ int main()
     if (benchmark)
     {
         float flops = 2.0 * M * N * K;
-        float h100 = 66.9e12;
+        float h100 = 19.5e12;
 
         std::function<void()> cublas_func = [&]()
         {
