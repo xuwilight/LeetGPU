@@ -605,7 +605,11 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, alpha, beta, tmaA_desc, tmaB_desc);
 }
 
-// nvcc submission.cu -O3 -arch=sm_90a -lcuda -lcublas -o submission && ./submission
+/**
+ * nvcc wgmma_tma_128BSW.cu -O3 -arch=sm_90a -lcuda -lcublas -o wgmma_tma_128BSW && ./wgmma_tma_128BSW
+ * cublas time = 0.178304 ms, TFLPOS = 770.811070, mfu = 0.779384
+ * mma time = 0.192716 ms, TFLPOS = 713.166569, mfu = 0.721099
+ */
 int main()
 {
     srand(1234);
@@ -647,12 +651,19 @@ int main()
     cublasCreate(&handle);
     const __half alpha = 1.0f, beta = 0.0f;
     // C is column-major
-    cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
-                reinterpret_cast<const __half *>(&alpha),
-                reinterpret_cast<__half *>(d_A.data().get()), K,
-                reinterpret_cast<__half *>(d_B.data().get()), N,
-                reinterpret_cast<const __half *>(&beta),
-                reinterpret_cast<__half *>(d_C1.data().get()), M);
+    // cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
+    //             reinterpret_cast<const __half *>(&alpha),
+    //             reinterpret_cast<__half *>(d_A.data().get()), K,
+    //             reinterpret_cast<__half *>(d_B.data().get()), N,
+    //             reinterpret_cast<const __half *>(&beta),
+    //             reinterpret_cast<__half *>(d_C1.data().get()), M);
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                 reinterpret_cast<__half *>(d_B.data().get()), CUDA_R_16F, N,
+                 reinterpret_cast<__half *>(d_A.data().get()), CUDA_R_16F, K,
+                 &beta,
+                 reinterpret_cast<__half *>(d_C1.data().get()), CUDA_R_16F, N,
+                 CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
     ref_res = d_C1;
 
     solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
@@ -667,12 +678,14 @@ int main()
         float h100 = 989e12;
 
         std::function<void()> cublas_func = [&]()
-        { cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
-                      reinterpret_cast<const __half *>(&alpha),
-                      reinterpret_cast<__half *>(d_A.data().get()), K,
-                      reinterpret_cast<__half *>(d_B.data().get()), N,
-                      reinterpret_cast<const __half *>(&beta),
-                      reinterpret_cast<__half *>(d_C1.data().get()), M); };
+        {
+            cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                         reinterpret_cast<__half *>(d_B.data().get()), CUDA_R_16F, N,
+                         reinterpret_cast<__half *>(d_A.data().get()), CUDA_R_16F, K,
+                         &beta,
+                         reinterpret_cast<__half *>(d_C1.data().get()), CUDA_R_16F, N,
+                         CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        };
 
         std::function<void()> custom_func = [&]()
         {

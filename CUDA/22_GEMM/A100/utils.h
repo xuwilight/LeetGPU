@@ -35,16 +35,46 @@ void run_benchmark(std::function<void()> kernel_func,
     cudaEventDestroy(stop);
 }
 
-template<class T>
+// template <class T>
+// void test_gemm(float *ref_result, T *mma_result, int M, int N, int K, float atol = 5e-2, float rtol = 5e-2)
+// {
+//     for (int i = 0; i < M; ++i)
+//     {
+//         for (int j = 0; j < N; ++j)
+//         {
+//             float ref_v = static_cast<float>(ref_result[j * M + i]);
+//             float mma_v = static_cast<float>(mma_result[j + i * N]);
+//             // |a - b| ≤ atol + rtol × |b|
+//             if (std::isnan(mma_v) || abs(ref_v - mma_v) > atol + rtol * abs(mma_v))
+//             {
+//                 printf("i = %d, j = %d, ref = %f, mma = %f \n", i, j, ref_v, mma_v);
+//                 return;
+//             }
+//             // printf("i = %d, j = %d, ref = %f, mma = %f \n", i, j, ref_v, mma_v);
+//         }
+//     }
+//     printf("gemm success\n");
+// }
+
+template <class T, bool row_major_c = true>
 void test_gemm(T *ref_result, T *mma_result, int M, int N, int K)
 {
     for (int i = 0; i < M; ++i)
     {
         for (int j = 0; j < N; ++j)
         {
-            float ref_v = static_cast<float>(ref_result[j * M + i]);
-            float mma_v = static_cast<float>(mma_result[i * N + j]);
-            if (std::isnan(mma_v) || abs(ref_v - mma_v) > 1e-8)
+            float mma_v = 0.0f;
+            float ref_v = static_cast<float>(ref_result[i * N + j]);
+            if (row_major_c)
+            {
+                mma_v = static_cast<float>(mma_result[i * N + j]);
+            }
+            else
+            {
+                mma_v = static_cast<float>(mma_result[j * M + i]);
+            }
+
+            if (std::isnan(mma_v) || abs(ref_v - mma_v) > 1e-5)
             {
                 printf("i = %d, j = %d, ref = %f, mma = %f \n", i, j, ref_v, mma_v);
                 return;

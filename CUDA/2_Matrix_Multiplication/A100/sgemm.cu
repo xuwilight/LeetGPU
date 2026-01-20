@@ -5,6 +5,7 @@
 #include <thrust/device_vector.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <mma.h>
 #include "utils.h"
 
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1>
@@ -56,14 +57,14 @@ __global__ void sgemm_v1(const T *A, const T *B, float *C, int M, int N, int K)
 }
 
 /**
- * Block Size: 128x64x32
+ * Block Size: 64x64x32
  * Threads: 128 (4 Warps)
  *
  * A (M×K) is row-major, B (K×N) is row-major
  *
- * 1. Block Tile: 128x64 (Computed by 1 CTA)
- * 2. Warp Tile:  64x32   (Computed by 1 Warp) -> Layout: 2x2 Warps
- * 3. Thread Tile:  8x8   (Computed by 1 Thread) -> Layout within Warp: 8x4 Threads
+ * 1. Block Tile: 64x64 (Computed by 1 CTA)
+ * 2. Warp Tile:  32x32   (Computed by 1 Warp) -> Layout: 2x2 Warps
+ * 3. Thread Tile:  4x8   (Computed by 1 Thread) -> Layout within Warp: 8x4 Threads
  */
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
 __global__ void sgemm_v2(const T *A, const T *B, float *C, int M, int N, int K)
@@ -204,7 +205,7 @@ __global__ void sgemm_v3(const T *A, const T *B, float *C, int M, int N, int K)
     const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    const int m_val = 8; // m_val per thread in M
+    const int m_val = 4; // m_val per thread in M
     const int n_val = 8; // n_val per thread in N
 
     // warp tile
@@ -216,7 +217,7 @@ __global__ void sgemm_v3(const T *A, const T *B, float *C, int M, int N, int K)
     const int tid_col_in_warp = lane_id % 4;
 
     // The starting row (M) and col (N) for this thread's result tile
-    const int row_offset = warp_row * 64 + tid_row_in_warp * m_val;
+    const int row_offset = warp_row * 32 + tid_row_in_warp * m_val;
     const int col_offset = warp_col * 32 + tid_col_in_warp * n_val;
 
     // thread block swizzle
@@ -341,6 +342,31 @@ __device__ void cp_async_size16(T *smem, const T *gmem)
                  "n"(sizeof(float4)));
 }
 
+__device__ __forceinline__ void serpentine_mma(
+    float *C, float *A, float *B, int m_val, int n_val)
+{
+
+#pragma unroll
+    for (int n = 0; n < n_val; n += 2)
+    {
+#pragma unroll
+        for (int m = 0; m < m_val; m += 2)
+        {
+            int m_serp = (n % 4) ? (m_val - 2 - m) : m;
+
+            float a0 = A[m_serp];
+            float a1 = A[m_serp + 1];
+            float b0 = B[n];
+            float b1 = B[n + 1];
+
+            C[(m_serp + 0) * n_val + (n + 0)] += a0 * b0;
+            C[(m_serp + 1) * n_val + (n + 0)] += a1 * b0;
+            C[(m_serp + 1) * n_val + (n + 1)] += a1 * b1;
+            C[(m_serp + 0) * n_val + (n + 1)] += a0 * b1;
+        }
+    }
+}
+
 /**
  * sgemm_v4 based on sgemm_v3.
  * 1. cp.async
@@ -380,11 +406,12 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
     auto gC = C + x * bM * N + y * bN; // C is N-major
 
     extern __shared__ T shared_memory[];
+    // __shared__ T shared_memory[(bM + bN) * bK * NumPipe];
     T *sA = shared_memory;
     T *sB = shared_memory + bM * bK * NumPipe;
 
     float reg_c[m_val * n_val] = {0.0f};
-    float reg_a[m_val * 2]; // bK contiguous
+    float reg_a[m_val * 2]; // bM contiguous
     float reg_b[n_val * 2]; // bN contiguous
 
     int numK = (K + bK - 1) / bK;
@@ -455,7 +482,7 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
     {
         int logical_row = ((row_offset + i) / m_val) % 8;
         int logical_col = logical_row ^ 0; // the 0th col
-        reg_a[i * 2 + 0] = tile_sA[(row_offset + i) * bK + logical_col * 4 + 0];
+        reg_a[0 * 2 + i] = tile_sA[(row_offset + i) * bK + logical_col * 4 + 0];
     }
 #pragma unroll
     for (int j = 0; j < 2; ++j) // n_val / 4 = 2
@@ -476,15 +503,20 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
                 __syncthreads();
             }
 
-#pragma unroll
-            for (int i = 0; i < m_val; ++i)
-            {
-#pragma unroll
-                for (int j = 0; j < n_val; ++j)
-                {
-                    reg_c[i * n_val + j] += reg_a[i * 2 + (tk % 2)] * reg_b[j + (tk % 2) * n_val];
-                }
-            }
+            int reg_idx = tk % 2;
+            auto frag_a = reg_a + reg_idx * m_val;
+            auto frag_b = reg_b + reg_idx * n_val;
+            serpentine_mma(reg_c, frag_a, frag_b, m_val, n_val);
+
+            // #pragma unroll
+            //             for (int i = 0; i < m_val; ++i)
+            //             {
+            // #pragma unroll
+            //                 for (int j = 0; j < n_val; ++j)
+            //                 {
+            //                     reg_c[i * n_val + j] += reg_a[i + reg_idx * m_val] * reg_b[j + reg_idx * n_val];
+            //                 }
+            //             }
 
             int tk_next = (tk + 1) % bK;
 #pragma unroll
@@ -492,7 +524,7 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
             {
                 int logical_row = ((row_offset + i) / m_val) % 8;
                 int logical_col = logical_row ^ (tk_next / 4);
-                reg_a[i * 2 + (tk_next % 2)] = tile_sA[(row_offset + i) * bK + logical_col * 4 + tk_next % 4];
+                reg_a[i + (tk_next % 2) * m_val] = tile_sA[(row_offset + i) * bK + logical_col * 4 + tk_next % 4];
             }
 #pragma unroll
             for (int j = 0; j < 2; ++j)
@@ -615,6 +647,13 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
     cudaDeviceSynchronize();
 }
 
+/**
+ * nvcc sgemm.cu -O3 -arch=sm_80 -lcuda -lcublas -o sgemm && ./sgemm
+ * 128×64×32
+ * gemm success
+ * cublas time = 21.706945 ms, TFLPOS = 18.994698, mfu = 0.974087
+ * mma time = 23.774439 ms, TFLPOS = 17.342863, mfu = 0.889378
+ */
 int main()
 {
     srand(1234);
@@ -660,7 +699,8 @@ int main()
     cublasCreate(&handle);
     const float alpha = 1.0f, beta = 0.0f;
     // C is column-major
-    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M);
+    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M); // MFU = 0.961104
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B.data().get(), N, d_A.data().get(), K, &beta, d_C1.data().get(), N); // MFU = 0.974298
     ref_res = d_C1;
 
     test_gemm(ref_res.data(), mma_res.data(), M, N, K);
@@ -673,7 +713,7 @@ int main()
 
         std::function<void()> cublas_func = [&]()
         {
-            cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M);
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B.data().get(), N, d_A.data().get(), K, &beta, d_C1.data().get(), N);
         };
 
         std::function<void()> custom_func = [&]()

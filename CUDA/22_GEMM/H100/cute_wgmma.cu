@@ -219,6 +219,9 @@ extern "C" void solve(half_t *A, half_t *B, half_t *C, int M, int N, int K, floa
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, tma_a, tma_b, tma_c);
 }
 
+// nvcc cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
+// cublas time = 0.178407 ms, TFLPOS = 770.367145, mfu = 0.778935
+// mma time = 0.189971 ms, TFLPOS = 723.473953, mfu = 0.731521
 int main()
 {
     srand(1234);
@@ -240,31 +243,35 @@ int main()
 
     for (int i = 0; i < M * K; ++i)
     {
-        h_A[i] = static_cast<T>(rand() % 9 * 1.0);
+        h_A[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
     }
     for (int i = 0; i < N * K; ++i)
     {
-        h_B[i] = static_cast<T>(rand() % 9 * 1.0);
+        h_B[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
     }
-
+    for (int i = 0; i < N * K; ++i)
+    {
+        h_C[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+    }
     thrust::device_vector<T> d_A = h_A;
     thrust::device_vector<T> d_B = h_B;
-    thrust::device_vector<TC> d_C = h_C;
+    thrust::device_vector<TC> d_C1 = h_C;
+    thrust::device_vector<TC> d_C2 = h_C;
 
-    solve(d_A.data().get(), d_B.data().get(), d_C.data().get(), M, N, K, 1.0f, 0.0f);
-    mma_res = d_C;
+    solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
+    mma_res = d_C2;
 
     cublasHandle_t handle;
     cublasCreate(&handle);
     const __half alpha = 1.0f, beta = 0.0f;
     // C is column-major
-    cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
-                reinterpret_cast<const __half *>(&alpha),
-                reinterpret_cast<__half *>(d_A.data().get()), K,
-                reinterpret_cast<__half *>(d_B.data().get()), N,
-                reinterpret_cast<const __half *>(&beta),
-                reinterpret_cast<__half *>(d_C.data().get()), M);
-    ref_res = d_C;
+    cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                 reinterpret_cast<__half *>(d_B.data().get()), CUDA_R_16F, N,
+                 reinterpret_cast<__half *>(d_A.data().get()), CUDA_R_16F, K,
+                 &beta,
+                 reinterpret_cast<__half *>(d_C1.data().get()), CUDA_R_16F, N,
+                 CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    ref_res = d_C1;
 
     test_gemm(ref_res.data(), mma_res.data(), M, N, K);
 
@@ -275,16 +282,18 @@ int main()
         float h100 = 989e12;
 
         std::function<void()> cublas_func = [&]()
-        { cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
-                      reinterpret_cast<const __half *>(&alpha),
-                      reinterpret_cast<__half *>(d_A.data().get()), K,
-                      reinterpret_cast<__half *>(d_B.data().get()), N,
-                      reinterpret_cast<const __half *>(&beta),
-                      reinterpret_cast<__half *>(d_C.data().get()), M); };
+        {
+            cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
+                         reinterpret_cast<__half *>(d_B.data().get()), CUDA_R_16F, N,
+                         reinterpret_cast<__half *>(d_A.data().get()), CUDA_R_16F, K,
+                         &beta,
+                         reinterpret_cast<__half *>(d_C1.data().get()), CUDA_R_16F, N,
+                         CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        };
 
         std::function<void()> custom_func = [&]()
         {
-            solve(d_A.data().get(), d_B.data().get(), d_C.data().get(), M, N, K, 1.0f, 0.0f);
+            solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);

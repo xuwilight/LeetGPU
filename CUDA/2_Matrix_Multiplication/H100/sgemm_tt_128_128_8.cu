@@ -144,6 +144,37 @@ __global__ void sgemm_v2(const T *A, const T *B, float *C, int M, int N, int K)
     }
 }
 
+template <int N>
+__device__ void cp_async_wait()
+{
+    if constexpr (N == 0)
+    {
+        asm volatile("cp.async.wait_all;\n" ::);
+    }
+    else
+    {
+        asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+    }
+}
+
+template <class T>
+__device__ void cp_async_size4(T *smem, const T *gmem)
+{
+    __uint32_t smem_int_ptr = static_cast<__uint32_t>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem),
+                 "n"(sizeof(float)));
+}
+
+template <class T>
+__device__ void cp_async_size16(T *smem, const T *gmem)
+{
+    __uint32_t smem_int_ptr = static_cast<__uint32_t>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(smem_int_ptr),
+                 "l"(gmem),
+                 "n"(sizeof(float4)));
+}
+
 __device__ __forceinline__ float ld_global(const float *ptr)
 {
     float ret;
@@ -196,7 +227,7 @@ __device__ __forceinline__ void serpentine_mma(
 
 template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1, int base = 0>
 __global__ void
-sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C, int M, int N, int K)
+sgemm_v4_h200(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C, int M, int N, int K)
 {
     const int tid = threadIdx.x;
     const int warp_id = tid / 32;
@@ -233,11 +264,7 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
 
     extern __shared__ T shared_memory[];
     T *sA = shared_memory;
-    T *sB = shared_memory + bM_pad * bK * NumPipe; // padding sA
-
-    // Registers
-    float reg_load_gA[8]; // 128 theads load 128*8 float, 1 thead load 8 float.
-    float reg_load_gB[8];
+    T *sB = shared_memory + bM_pad * bK * NumPipe;
 
     float reg_c[m_val * n_val] = {0.0f};
     float reg_a[m_val * 2];
@@ -250,20 +277,20 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
     constexpr int nbN = bN / 4;
 
     // prefetch
-    auto tile_gA = gA + k_tile_next * bK;
-    auto tile_gB = gB;
     for (int k_pipe = 0; k_pipe < NumPipe - 1; ++k_pipe)
     {
+        auto tile_gA = gA + k_tile_next * bK;
+        auto tile_gB = gB;
         auto tile_sA = sA + k_pipe * bM_pad * bK;
         auto tile_sB = sB + k_pipe * bN_pad * bK;
 
         // load gA
 #pragma unroll
-        for (int i = 0; i < 8; ++i) // 128 / (128 / 8) = 8
+        for (int i = 0; i < 8; ++i) // 128 * 8 / 128 = 8
         {
             int row = tid / 8 + i * 16;
             int col = tid % 8;
-            reg_load_gA[i] = ld_global(tile_gA + row * K + col);
+            cp_async_size4(tile_sA + col * bM_pad + row, tile_gA + row * K + col);
         }
 
         // load gB
@@ -271,24 +298,9 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
         for (int i = 0; i < 8; ++i)
         {
             int global_row = k_tile_next * bK + i;
-            reg_load_gB[i] = ld_global(tile_gB + global_row * N + tid);
+            cp_async_size4(tile_sB + i * bN_pad + tid, tile_gB + global_row * N + tid);
         }
-
-        // save to sA
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-        {
-            int row = tid / 8 + i * 16;
-            int col = tid % 8;
-            (tile_sA + col * bM_pad)[row] = reg_load_gA[i];
-        }
-
-        // save to sB
-#pragma unroll
-        for (int i = 0; i < 8; ++i)
-        {
-            (tile_sB + i * bN_pad)[tid] = reg_load_gB[i];
-        }
+        asm volatile("cp.async.commit_group;\n" ::);
 
         --k_tile_count;
         if (k_tile_count > 0)
@@ -303,23 +315,16 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
     auto tile_sA = sA + smem_pipe_read * bM_pad * bK;
     auto tile_sB = sB + smem_pipe_read * bN_pad * bK;
 
+    cp_async_wait<NumPipe - 2>(); // at least one stage is ready
     __syncthreads();
 
     // prefetch smem to rmem
     reinterpret_cast<float4 *>(reg_a)[0] = reinterpret_cast<float4 *>(tile_sA + row_offset)[0];
     reinterpret_cast<float4 *>(reg_a)[1] = reinterpret_cast<float4 *>(tile_sA + row_offset)[1];
-
-#pragma unroll
-    for (int i = 0; i < 8; ++i)
-    {
-        reg_b[i + 0] = (tile_sB + col_offset1)[i];
-        reg_b[i + 8] = (tile_sB + col_offset2)[i];
-    }
-
-    // reinterpret_cast<float4 *>(reg_b)[0] = reinterpret_cast<float4 *>(tile_sB + col_offset1)[0];
-    // reinterpret_cast<float4 *>(reg_b)[1] = reinterpret_cast<float4 *>(tile_sB + col_offset1)[1];
-    // reinterpret_cast<float4 *>(reg_b)[2] = reinterpret_cast<float4 *>(tile_sB + col_offset2)[0];
-    // reinterpret_cast<float4 *>(reg_b)[3] = reinterpret_cast<float4 *>(tile_sB + col_offset2)[1];
+    reinterpret_cast<float4 *>(reg_b)[0] = reinterpret_cast<float4 *>(tile_sB + col_offset1)[0];
+    reinterpret_cast<float4 *>(reg_b)[1] = reinterpret_cast<float4 *>(tile_sB + col_offset1)[1];
+    reinterpret_cast<float4 *>(reg_b)[2] = reinterpret_cast<float4 *>(tile_sB + col_offset2)[0];
+    reinterpret_cast<float4 *>(reg_b)[3] = reinterpret_cast<float4 *>(tile_sB + col_offset2)[1];
 
     while (k_tile_count > -(NumPipe - 1))
     {
@@ -329,25 +334,61 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
             if (tk == bK - 1)
             {
                 // reg store to smem
-                tile_sA = sA + smem_pipe_write * bM_pad * bK;
-                tile_sB = sB + smem_pipe_write * bN_pad * bK;
+                tile_sA = sA + smem_pipe_read * bM_pad * bK;
+                tile_sB = sB + smem_pipe_read * bN_pad * bK;
+                cp_async_wait<NumPipe - 2>();
+                __syncthreads();
+            }
 
-                // save to sA
+            int reg_idx = tk % 2;
+            int reg_next_idx = reg_idx ^ 1;
+            int tk_next = (tk + 1) % bK;
+            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 0] = reinterpret_cast<float4 *>(tile_sA + tk_next * bM_pad + row_offset)[0];
+            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 1] = reinterpret_cast<float4 *>(tile_sA + tk_next * bM_pad + row_offset)[1];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 0] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset1)[0];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 1] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset1)[1];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 2] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset2)[0];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 3] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset2)[1];
+
+            auto frag_a = reg_a + reg_idx * m_val;
+            auto frag_b = reg_b + reg_idx * n_val;
+            serpentine_mma(reg_c, frag_a, frag_b, m_val, n_val);
+
+            // #pragma unroll
+            //             for (int i = 0; i < m_val; ++i)
+            //             {
+            // #pragma unroll
+            //                 for (int j = 0; j < n_val; ++j)
+            //                 {
+            //                     reg_c[i * n_val + j] += reg_a[i + reg_idx * m_val] * reg_b[j + reg_idx * n_val];
+            //                 }
+            //             }
+
+            if (tk == 0)
+            {
+                // load from gmem to smem buffer
+                auto tile_gA_write = gA + k_tile_next * bK;
+                auto tile_gB_write = gB;
+
+                auto tile_sA = sA + smem_pipe_write * bM_pad * bK;
+                auto tile_sB = sB + smem_pipe_write * bN_pad * bK;
+
 #pragma unroll
-                for (int i = 0; i < 8; ++i)
+                for (int i = 0; i < 8; ++i) // 128 / (128 / 8) = 8
                 {
                     int row = tid / 8 + i * 16;
                     int col = tid % 8;
-                    (tile_sA + col * bM_pad)[row] = reg_load_gA[i];
+                    cp_async_size4(tile_sA + col * bM_pad + row, tile_gA_write + row * K + col);
                 }
 
-                // save to sB
+                // load gB
 #pragma unroll
                 for (int i = 0; i < 8; ++i)
                 {
-                    (tile_sB + i * bN_pad)[tid] = reg_load_gB[i];
+                    int global_row = k_tile_next * bK + i;
+                    cp_async_size4(tile_sB + i * bN_pad + tid, tile_gB_write + global_row * N + tid);
                 }
-                __syncthreads();
+                asm volatile("cp.async.commit_group;\n" ::);
 
                 --k_tile_count;
                 if (k_tile_count > 0)
@@ -356,59 +397,6 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
                 }
                 smem_pipe_write = smem_pipe_read;
                 smem_pipe_read = (smem_pipe_read == NumPipe - 1) ? 0 : smem_pipe_read + 1;
-            }
-
-            int reg_idx = tk % 2;
-            int reg_next_idx = reg_idx ^ 1;
-            int tk_next = (tk + 1) % bK;
-            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 0] = reinterpret_cast<float4 *>(tile_sA + tk_next * bM_pad + row_offset)[0];
-            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 1] = reinterpret_cast<float4 *>(tile_sA + tk_next * bM_pad + row_offset)[1];
-
-#pragma unroll
-            for (int i = 0; i < 8; ++i)
-            {
-                reg_b[reg_next_idx * 16 + i + 0] = (tile_sB + tk_next * bN_pad + col_offset1)[i];
-                reg_b[reg_next_idx * 16 + i + 8] = (tile_sB + tk_next * bN_pad + col_offset2)[i];
-            }
-
-            // reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 0] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset1)[0];
-            // reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 1] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset1)[1];
-            // reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 2] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset2)[0];
-            // reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 3] = reinterpret_cast<float4 *>(tile_sB + tk_next * bN_pad + col_offset2)[1];
-
-            // auto frag_a = reg_a + reg_idx * m_val;
-            // auto frag_b = reg_b + reg_idx * n_val;
-            // serpentine_mma(reg_c, frag_a, frag_b, m_val, n_val);
-
-#pragma unroll
-            for (int i = 0; i < m_val; ++i)
-            {
-#pragma unroll
-                for (int j = 0; j < n_val; ++j)
-                {
-                    reg_c[i * n_val + j] += reg_a[i + reg_idx * m_val] * reg_b[j + reg_idx * n_val];
-                }
-            }
-
-            if (tk == 0)
-            {
-                // load from gmem to smem buffer
-                auto tile_gA_write = gA + k_tile_next * bK;
-                auto tile_gB_write = gB;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) // 128 / (128 / 8) = 8
-                {
-                    int row = tid / 8 + i * 16;
-                    int col = tid % 8;
-                    reg_load_gA[i] = ld_global(tile_gA_write + row * K + col);
-                }
-
-#pragma unroll
-                for (int i = 0; i < 8; ++i)
-                {
-                    int global_row = k_tile_next * bK + i;
-                    reg_load_gB[i] = ld_global(tile_gB_write + global_row * N + tid);
-                }
             }
         }
     }
@@ -436,6 +424,196 @@ sgemm_v4(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C
     }
 }
 
+/**
+ * 把 cp.async 打散在每一个bK循环中，防止在第0个同时启动把带宽打满，可以提高一点点
+ */
+template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 3, int base = 0>
+__global__ void
+sgemm_v5_h200(const T *__restrict__ A, const T *__restrict__ B, float *__restrict__ C, int M, int N, int K)
+{
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    constexpr int m_val = 8;
+    constexpr int n_val = 16;
+    constexpr int PAD = 4;
+    constexpr int bM_pad = bM + PAD;
+    constexpr int bN_pad = bN + PAD;
+
+    // warp tile
+    const int warp_m_idx = warp_id % 2;
+    const int warp_n_idx = warp_id / 2;
+
+    // thread tile
+    const int lane_row = lane_id / 4;
+    const int lane_col = lane_id % 4;
+
+    const int row_offset = warp_m_idx * 64 + lane_row * m_val;
+    const int col_offset1 = warp_n_idx * 32 + lane_col * n_val / 2;
+    const int col_offset2 = col_offset1 + 64;
+
+    // thread block swizzle
+    int ox = blockIdx.x;
+    int oy = blockIdx.y;
+    int y = (oy << base) + (ox & ((1 << base) - 1));
+    int x = (ox >> base);
+
+    auto gA = A + x * bM * K;
+    auto gB = B + y * bN;
+    auto gC = C + x * bM * N + y * bN;
+
+    extern __shared__ T shared_memory[];
+    T *sA = shared_memory;
+    T *sB = shared_memory + bM_pad * bK * NumPipe;
+
+    float reg_c[m_val * n_val] = {0.0f};
+    float reg_a[m_val * 2];
+    float reg_b[n_val * 2];
+
+    int numK = (K + bK - 1) / bK;
+    int k_tile_count = numK;
+    int k_tile_next = 0;
+
+    constexpr int nbN = bN / 4;
+
+    // prefetch
+    for (int k_pipe = 0; k_pipe < NumPipe - 1; ++k_pipe)
+    {
+        auto tile_gA = gA + k_tile_next * bK;
+        auto tile_gB = gB;
+        auto tile_sA = sA + k_pipe * bM_pad * bK;
+        auto tile_sB = sB + k_pipe * bN_pad * bK;
+
+        // load gA
+#pragma unroll
+        for (int i = 0; i < 8; ++i) // 128 * 8 / 128 = 8
+        {
+            int row = tid / 8 + i * 16;
+            int col = tid % 8;
+            cp_async_size4(tile_sA + col * bM_pad + row, tile_gA + row * K + col);
+        }
+
+        // load gB
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+        {
+            int global_row = k_tile_next * bK + i;
+            cp_async_size4(tile_sB + i * bN_pad + tid, tile_gB + global_row * N + tid);
+        }
+        asm volatile("cp.async.commit_group;\n" ::);
+
+        --k_tile_count;
+        if (k_tile_count > 0)
+        {
+            ++k_tile_next;
+        }
+    }
+
+    int smem_pipe_read = 0;
+    int smem_pipe_write = NumPipe - 1;
+
+    // Wait for the first stage (Stage 0) to be ready
+    cp_async_wait<NumPipe - 2>();
+    __syncthreads();
+
+    // Initial Prefetch: Smem -> Register (for tk=0 of the first loop)
+    auto tile_sA_read = sA + smem_pipe_read * bM_pad * bK;
+    auto tile_sB_read = sB + smem_pipe_read * bN_pad * bK;
+
+    reinterpret_cast<float4 *>(reg_a)[0] = reinterpret_cast<float4 *>(tile_sA_read + row_offset)[0];
+    reinterpret_cast<float4 *>(reg_a)[1] = reinterpret_cast<float4 *>(tile_sA_read + row_offset)[1];
+    reinterpret_cast<float4 *>(reg_b)[0] = reinterpret_cast<float4 *>(tile_sB_read + col_offset1)[0];
+    reinterpret_cast<float4 *>(reg_b)[1] = reinterpret_cast<float4 *>(tile_sB_read + col_offset1)[1];
+    reinterpret_cast<float4 *>(reg_b)[2] = reinterpret_cast<float4 *>(tile_sB_read + col_offset2)[0];
+    reinterpret_cast<float4 *>(reg_b)[3] = reinterpret_cast<float4 *>(tile_sB_read + col_offset2)[1];
+
+    auto tile_gA_write = gA + k_tile_next * bK;
+    auto tile_gB_write = gB;
+    auto tile_sA_write = sA + smem_pipe_write * bM_pad * bK;
+    auto tile_sB_write = sB + smem_pipe_write * bN_pad * bK;
+    cp_async_size4(tile_sA_write + (tid % 8) * bM_pad + (tid / 8), tile_gA_write + (tid / 8) * K + (tid % 8));
+    cp_async_size4(tile_sB_write + 0 * bN_pad + tid, tile_gB_write + k_tile_next * bK * N + tid);
+
+    while (k_tile_count > -(NumPipe - 1))
+    {
+#pragma unroll
+        for (int tk = 0; tk < bK; ++tk)
+        {
+            if (tk == bK - 1)
+            {
+                asm volatile("cp.async.commit_group;\n" ::);
+                cp_async_wait<NumPipe - 2>();
+                __syncthreads();
+
+                // Advance stage indices
+                smem_pipe_write = smem_pipe_read;
+                smem_pipe_read = (smem_pipe_read == NumPipe - 1) ? 0 : smem_pipe_read + 1;
+
+                --k_tile_count;
+                if (k_tile_count > 0)
+                {
+                    ++k_tile_next;
+                }
+
+                tile_sA_read = sA + smem_pipe_read * bM_pad * bK;
+                tile_sB_read = sB + smem_pipe_read * bN_pad * bK;
+
+                tile_gA_write = gA + k_tile_next * bK;
+                tile_gB_write = gB;
+                tile_sA_write = sA + smem_pipe_write * bM_pad * bK;
+                tile_sB_write = sB + smem_pipe_write * bN_pad * bK;
+            }
+
+            int tk_next = (tk + 1) % bK;
+            int reg_idx = tk % 2;
+            int reg_next_idx = reg_idx ^ 1;
+
+            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 0] = reinterpret_cast<float4 *>(tile_sA_read + tk_next * bM_pad + row_offset)[0];
+            reinterpret_cast<float4 *>(reg_a)[reg_next_idx * 2 + 1] = reinterpret_cast<float4 *>(tile_sA_read + tk_next * bM_pad + row_offset)[1];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 0] = reinterpret_cast<float4 *>(tile_sB_read + tk_next * bN_pad + col_offset1)[0];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 1] = reinterpret_cast<float4 *>(tile_sB_read + tk_next * bN_pad + col_offset1)[1];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 2] = reinterpret_cast<float4 *>(tile_sB_read + tk_next * bN_pad + col_offset2)[0];
+            reinterpret_cast<float4 *>(reg_b)[reg_next_idx * 4 + 3] = reinterpret_cast<float4 *>(tile_sB_read + tk_next * bN_pad + col_offset2)[1];
+
+            auto frag_a = reg_a + reg_idx * m_val;
+            auto frag_b = reg_b + reg_idx * n_val;
+            serpentine_mma(reg_c, frag_a, frag_b, m_val, n_val);
+            int row = tid / 8 + tk_next * 16;
+            int col = tid % 8;
+            int global_row = k_tile_next * bK + tk_next;
+            cp_async_size4(tile_sA_write + col * bM_pad + row, tile_gA_write + row * K + col);
+            cp_async_size4(tile_sB_write + tk_next * bN_pad + tid, tile_gB_write + global_row * N + tid);
+        }
+    }
+
+    asm volatile("cp.async.commit_group;\n" ::);
+    asm volatile("cp.async.wait_group 0;\n" ::);
+    __syncthreads();
+
+#pragma unroll
+    for (int i = 0; i < m_val; ++i)
+    {
+        int local_row = row_offset + i;
+#pragma unroll
+        for (int j = 0; j < n_val / 4; ++j)
+        {
+            int local_col = col_offset1 + (j % 2) * 4 + 64 * (j / 2);
+            reinterpret_cast<float4 *>(shared_memory + local_row * bN + local_col)[0] = reinterpret_cast<float4 *>(reg_c + i * n_val)[j]; // reuse shared memory
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int i = tid; i < bM * nbN; i += NumThreads)
+    {
+        int row = i / nbN;
+        int col = i % nbN;
+        reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * bN)[col];
+    }
+}
+
+
 // A, B, C are device pointers (i.e. pointers to memory on the GPU)
 extern "C" void solve(const float *A, const float *B, float *C, int M, int N, int K)
 {
@@ -446,16 +624,17 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
     // M = M;
 
     using T = float;
-    constexpr int num_threads = 128;
 
     if (M == 8192 && K == 6144 && N == 4096)
     {
         // benchmark
+        constexpr int num_threads = 128;
+
         constexpr int blockM = 128;
         constexpr int blockN = 128;
         constexpr int blockK = 8;
 
-        constexpr int numPipe = 2;
+        constexpr int numPipe = 3;
         int num_blockM = (M + blockM - 1) / blockM;
         int num_blockN = (N + blockN - 1) / blockN;
 
@@ -468,12 +647,13 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
         dim3 grid(num_blockM, num_blockN);
         int num_smem_values = max(blockM * blockN, (blockM + blockN) * blockK * numPipe);
         int smem_size = int(sizeof(T) * num_smem_values);
-        auto kernel_fptr = sgemm_v4<blockM, blockN, blockK, num_threads, T, numPipe, base>;
+        auto kernel_fptr = sgemm_v5_h200<blockM, blockN, blockK, num_threads, T, numPipe, base>;
         cudaFuncSetAttribute(kernel_fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
         kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K);
     }
     else
     {
+        constexpr int num_threads = 128;
         constexpr int blockM = 128;
         constexpr int blockN = 64;
         constexpr int blockK = 32;
@@ -489,6 +669,11 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
     cudaDeviceSynchronize();
 }
 
+
+
+/**
+ * nvcc sgemm_tt_128_128_8.cu -O3 -lcuda -lcublas -o sgemm_tt_128_128_8 -arch=sm_90a && ./sgemm_tt_128_128_8
+ */
 int main()
 {
     srand(1234);
@@ -534,7 +719,8 @@ int main()
     cublasCreate(&handle);
     const float alpha = 1.0f, beta = 0.0f;
     // C is column-major
-    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M);
+    // cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M);
+    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B.data().get(), N, d_A.data().get(), K, &beta, d_C1.data().get(), N);
     ref_res = d_C1;
 
     test_gemm(ref_res.data(), mma_res.data(), M, N, K);
@@ -543,11 +729,11 @@ int main()
     if (benchmark)
     {
         float flops = 2.0 * M * N * K;
-        float h100 = 19.5e12;
+        float h100 = 66.9e12;
 
         std::function<void()> cublas_func = [&]()
         {
-            cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K, &alpha, d_A.data().get(), K, d_B.data().get(), N, &beta, d_C1.data().get(), M);
+            cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, d_B.data().get(), N, d_A.data().get(), K, &beta, d_C1.data().get(), N);
         };
 
         std::function<void()> custom_func = [&]()
