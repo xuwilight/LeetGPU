@@ -9,6 +9,7 @@ __device__ __forceinline__ float4 add_float4(float4 a, float4 b)
     return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
 }
 
+// base
 __global__ void vector_add1(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -18,6 +19,7 @@ __global__ void vector_add1(const float *__restrict__ A, const float *__restrict
     }
 }
 
+// float4
 template <int stride = 4, int unroll = 4>
 __global__ void vector_add2(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
@@ -42,6 +44,7 @@ __global__ void vector_add2(const float *__restrict__ A, const float *__restrict
     }
 }
 
+// float4 + unroll
 template <int stride = 4, int unroll = 4>
 __global__ void vector_add3(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
@@ -70,7 +73,7 @@ __global__ void vector_add3(const float *__restrict__ A, const float *__restrict
     }
 }
 
-
+// 另一种写法，固定thread block的数量，从而减少启动开销。但是速度并没有提升
 template <int STRIDE, int UNROLL>
 __global__ void vector_add4(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int N)
 {
@@ -134,7 +137,7 @@ extern "C" void solve1(const float *A, const float *B, float *C, int N)
     constexpr int blocksPerGrid = 132 * 8; // 132 SMs * 8 Blocks
     constexpr int UNROLL = 4;
     constexpr int STRIDE = blocksPerGrid * threadsPerBlock;
-    vector_add3<STRIDE, UNROLL><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
+    vector_add4<STRIDE, UNROLL><<<blocksPerGrid, threadsPerBlock>>>(A, B, C, N);
 
     cudaDeviceSynchronize();
 }
