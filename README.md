@@ -1,5 +1,5 @@
 # LeetGPU
-一些 GPU 编程问题和各种实现
+Some CUDA programming problems and implementations
 
 - [x] vector_add
 - [x] matrix_transpose
