@@ -285,7 +285,6 @@ __global__ void mma_cpasync_kernel(const T *__restrict__ A, const T *__restrict_
 
     int stride = bN / 4;
     int num_vectors = (bM * bN) / 4;
-
 #pragma unroll
     for (int i = threadIdx.x; i < num_vectors; i += NumThreads)
     {
@@ -293,11 +292,11 @@ __global__ void mma_cpasync_kernel(const T *__restrict__ A, const T *__restrict_
         int col = (i % stride) * 4;
         float4 smem_vec = reinterpret_cast<float4 *>(shared_memory)[i];
 
+        // if use alpha and beta
         // float2 c_old = *reinterpret_cast<float2 *>(gC + row * N + col);
         // half2 *c_old_h2 = reinterpret_cast<half2 *>(&c_old);
         // half2 c_old_0 = c_old_h2[0];
         // half2 c_old_1 = c_old_h2[1];
-
         // smem_vec.x += static_cast<float>(c_old_0.x);
         // smem_vec.y += static_cast<float>(c_old_0.y);
         // smem_vec.z += static_cast<float>(c_old_1.x);
@@ -387,10 +386,12 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, alpha, beta);
 }
 
-// nvcc mma_cpasync_sm80.cu -O3 -arch=sm_90a -lcuda -lcublas -o mma_cpasync_sm80 && ./mma_cpasync_sm80
-// cublas time = 0.198920 ms, TFLPOS = 690.926826, mfu = 0.698612
-// mma time = 0.342564 ms, TFLPOS = 401.206183, mfu = 0.405669
-
+/**
+ * nvcc sm80_mma_cpasync.cu -O3 -arch=sm_80 -lcuda -lcublas -o sm80_mma_cpasync && ./sm80_mma_cpasync
+ * gemm success
+ * cublas time = 0.568996 ms, TFLPOS = 241.546394, mfu = 0.774187
+ * mma time = 0.672809 ms, TFLPOS = 204.276228, mfu = 0.654731
+ */
 int main()
 {
     float u = 1.0;
@@ -443,7 +444,7 @@ int main()
 
     ref_res = d_C1;
 
-    solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
+    solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, alpha, beta);
     mma_res = d_C2;
 
     test_gemm(ref_res.data(), mma_res.data(), M, N, K);
@@ -452,7 +453,7 @@ int main()
     if (benchmark)
     {
         float flops = 2.0 * M * N * K;
-        float h100 = 989e12;
+        float h100 = 312e12;
 
         std::function<void()> cublas_func = [&]()
         {
@@ -466,7 +467,7 @@ int main()
 
         std::function<void()> custom_func = [&]()
         {
-            solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
+            solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, alpha, beta);
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);

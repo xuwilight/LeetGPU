@@ -672,7 +672,7 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
 
 
 /**
- * nvcc sgemm_tt_128_128_8.cu -O3 -lcuda -lcublas -o sgemm_tt_128_128_8 -arch=sm_90a && ./sgemm_tt_128_128_8
+ * nvcc sm90_sgemm_m128n128k8.cu -O3 -lcuda -lcublas -o sm90_sgemm_m128n128k8 -arch=sm_90a && ./sm90_sgemm_m128n128k8
  */
 int main()
 {

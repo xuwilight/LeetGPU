@@ -219,7 +219,7 @@ extern "C" void solve(half_t *A, half_t *B, half_t *C, int M, int N, int K, floa
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, tma_a, tma_b, tma_c);
 }
 
-// nvcc cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
+// nvcc sm90_cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
 // cublas time = 0.178407 ms, TFLPOS = 770.367145, mfu = 0.778935
 // mma time = 0.189971 ms, TFLPOS = 723.473953, mfu = 0.731521
 int main()

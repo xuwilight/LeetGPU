@@ -648,7 +648,7 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
 }
 
 /**
- * nvcc sgemm.cu -O3 -arch=sm_80 -lcuda -lcublas -o sgemm && ./sgemm
+ * nvcc sm80_sgemm_m128n64k32.cu -O3 -arch=sm_80 -lcuda -lcublas -o sgemm && ./sgemm
  * 128×64×32
  * gemm success
  * cublas time = 21.706945 ms, TFLPOS = 18.994698, mfu = 0.974087

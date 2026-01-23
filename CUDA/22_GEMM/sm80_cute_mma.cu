@@ -224,7 +224,7 @@ extern "C" void solve(half_t *A, half_t *B, half_t *C, int M, int N, int K, floa
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, alpha, beta);
 }
 
-// nvcc cute_mma.cu -O3 -arch=sm_80 -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o mma --expt-relaxed-constexpr && ./mma
+// nvcc sm80_cute_mma.cu -O3 -arch=sm_80 -I ../../cutlass-3.8/include/ -I ../../cutlass-3.8/tools/util/include/ -lcuda -lcublas -o mma --expt-relaxed-constexpr && ./mma
 int main()
 {
     srand(1234);
@@ -232,7 +232,7 @@ int main()
     // A row-major
     // B row-major
 
-    int num = 1024;
+    int num = 4096;
     int M = num;
     int N = num;
     int K = num;
@@ -292,7 +292,7 @@ int main()
     if (benchmark)
     {
         float flops = 2.0 * M * N * K;
-        float h100 = 989e12;
+        float h100 = 312e12;
 
         std::function<void()> cublas_func = [&]()
         {

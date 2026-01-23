@@ -613,7 +613,7 @@ extern "C" void solve(const float *A, const float *B, float *C, int M, int N, in
     cudaDeviceSynchronize();
 }
 
-// nvcc sgemm_tt.cu -O3 -lcuda -lcublas -o sgemm_tt -arch=sm_90a && ./sgemm_tt
+// nvcc sm90_sgemm_m64n64k32.cu -O3 -lcuda -lcublas -o sgemm -arch=sm_90a && ./sgemm
 // cublas time = 8.150183 ms, TFLPOS = 50.589891, mfu = 0.756202
 // mma time = 11.728918 ms, TFLPOS = 35.153871, mfu = 0.525469
 int main()
