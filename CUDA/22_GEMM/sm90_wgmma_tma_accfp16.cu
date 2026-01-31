@@ -363,7 +363,11 @@ stmatrix_copy(uint32_t *frag, half *smem_dst)
         uint32_t a5 = frag[i * 4 + 1 + 32];
         uint32_t a6 = frag[i * 4 + 2 + 32];
         uint32_t a7 = frag[i * 4 + 3 + 32];
-        int offset = row * 128 + (col + i * 2) * 8 + warp_idx * 16 * 128;
+        // int offset = row * 128 + (col + i * 2) * 8 + warp_idx * 16 * 128;
+        int local_row = row * 128;
+        int local_col_sw = (col + i * 2) ^ (row % 8);
+        int offset = local_row + local_col_sw * 8 + warp_idx * 16 * 128;
+
         stmatrix_atom(a0, a1, a2, a3, smem_dst + offset);
         stmatrix_atom(a4, a5, a6, a7, smem_dst + offset + 8192);
     }
@@ -506,13 +510,16 @@ __global__ void wgmma_tma_kernel(const T *A, const T *B, TC *C, int M, int N, in
     stmatrix_copy(reg_c, shared_memory);
     __syncthreads();
 
-    int nbN = bN / 8; // use float4
+    int nbN = bN / 8; // float4 = 8 half
+    int row_base = threadIdx.x / nbN;
+    int col = threadIdx.x % nbN;
+    int col_sw = row_base ^ col;
 #pragma unroll
-    for (int i = threadIdx.x; i < bM * nbN; i += NumThreads)
+    for (int i = 0; i < 16; ++i) // 128 / (128tid / 16)
     {
-        int row = i / nbN;
-        int col = i % nbN;
-        reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * bN)[col];
+        int row = row_base + i * 8;
+        float4 smem_vec = reinterpret_cast<float4 *>(shared_memory + row * bN)[col_sw];
+        reinterpret_cast<float4 *>(gC + row * N)[col] = smem_vec;
     }
 }
 
@@ -607,8 +614,8 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
 
 /**
  * nvcc sm90_wgmma_tma_accfp16.cu -O3 -arch=sm_90a -lcuda -lcublas -o sm90_wgmma_tma_accfp16 && ./sm90_wgmma_tma_accfp16
- * cublas time = 0.178304 ms, TFLPOS = 770.811070, mfu = 0.779384
- * mma time = 0.192716 ms, TFLPOS = 713.166569, mfu = 0.721099
+ * cublas time = 0.188571 ms, TFLPOS = 728.845011, mfu = 0.736951
+ * wgmma time = 0.191733 ms, TFLPOS = 716.823129, mfu = 0.724796
  */
 int main()
 {
@@ -693,7 +700,7 @@ int main()
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);
-        run_benchmark(custom_func, "mma", flops, h100);
+        run_benchmark(custom_func, "wgmma", flops, h100);
     }
     return 0;
 }
