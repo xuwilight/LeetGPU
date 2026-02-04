@@ -71,37 +71,6 @@ __device__ void warpgroup_reg_alloc()
     asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(RegCount));
 }
 
-// // GMMA 64x128x16 F16+=F16*F16
-// template <int scale_D = 1, int scaleA = 1, int scaleB = 1, int tnspA = 0, int tnspB = 1>
-// __device__ static void
-// fma(uint64_t const &desc_a, uint64_t const &desc_b, uint32_t *c)
-// {
-//     asm volatile(
-//         "{\n"
-//         ".reg .pred p;\n"
-//         "setp.ne.b32 p, %34, 0;\n"
-//         "wgmma.mma_async.sync.aligned.m64n128k16.f16.f16.f16 "
-//         "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
-//         " %8,  %9,  %10, %11, %12, %13, %14, %15, "
-//         " %16, %17, %18, %19, %20, %21, %22, %23, "
-//         " %24, %25, %26, %27, %28, %29, %30, %31},"
-//         " %32,"
-//         " %33,"
-//         " p,   %35, %36, %37, %38;\n"
-//         "}\n"
-// : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]),
-//   "+r"(c[4]), "+r"(c[5]), "+r"(c[6]), "+r"(c[7]),
-//   "+r"(c[8]), "+r"(c[9]), "+r"(c[10]), "+r"(c[11]),
-//   "+r"(c[12]), "+r"(c[13]), "+r"(c[14]), "+r"(c[15]),
-//   "+r"(c[16]), "+r"(c[17]), "+r"(c[18]), "+r"(c[19]),
-//   "+r"(c[20]), "+r"(c[21]), "+r"(c[22]), "+r"(c[23]),
-//   "+r"(c[24]), "+r"(c[25]), "+r"(c[26]), "+r"(c[27]),
-//   "+r"(c[28]), "+r"(c[29]), "+r"(c[30]), "+r"(c[31])
-//         : "l"(desc_a),
-//           "l"(desc_b),
-//           "r"(int32_t(scale_D)), "n"(int32_t(scaleA)), "n"(int32_t(scaleB)), "n"(int32_t(tnspA)), "n"(int32_t(tnspB)));
-// }
-
 // GMMA 64x256x16 F16+=F16*F16
 template <int scale_D = 1, int scaleA = 1, int scaleB = 1, int tnspA = 0, int tnspB = 1>
 __device__ static void
@@ -415,9 +384,9 @@ stmatrix_atom(uint32_t const &src0, uint32_t const &src1, uint32_t const &src2, 
 }
 
 __device__ __forceinline__ static void
-stmatrix_copy(uint32_t *frag, half *smem_dst, int warpgroup_idx)
+stmatrix_copy_tile128(uint32_t *frag, half *smem_dst, int warpgroup_idx, int ep_idx)
 {
-    int rep = 16;
+    int rep = 8; // epN / 16
     int tid = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync() - 4 * warpgroup_idx; // second warp_idx offset
     int row = tid % 16;
@@ -426,88 +395,41 @@ stmatrix_copy(uint32_t *frag, half *smem_dst, int warpgroup_idx)
 #pragma unroll
     for (int i = 0; i < rep; ++i)
     {
-        uint32_t a0 = frag[i * 4 + 0];
-        uint32_t a1 = frag[i * 4 + 1];
-        uint32_t a2 = frag[i * 4 + 2];
-        uint32_t a3 = frag[i * 4 + 3];
+        int index = (i + ep_idx * 8) * 4;
+        uint32_t a0 = frag[index + 0];
+        uint32_t a1 = frag[index + 1];
+        uint32_t a2 = frag[index + 2];
+        uint32_t a3 = frag[index + 3];
 
-        uint32_t a4 = frag[i * 4 + 0 + 64];
-        uint32_t a5 = frag[i * 4 + 1 + 64];
-        uint32_t a6 = frag[i * 4 + 2 + 64];
-        uint32_t a7 = frag[i * 4 + 3 + 64];
-        // int offset = row * 128 + (col + i * 2) * 8 + warp_idx * 16 * 128;
-        int local_row = row * 256;
+        uint32_t a4 = frag[index + 0 + 64];
+        uint32_t a5 = frag[index + 1 + 64];
+        uint32_t a6 = frag[index + 2 + 64];
+        uint32_t a7 = frag[index + 3 + 64];
+
+        int local_row = row * 128;
         int local_col_sw = (col + i * 2) ^ (row % 8);
-        int offset = local_row + local_col_sw * 8 + warp_idx * 16 * 256;
+        int offset = local_row + local_col_sw * 8 + warp_idx * 16 * 128;
 
         stmatrix_atom(a0, a1, a2, a3, smem_dst + offset);
-        stmatrix_atom(a4, a5, a6, a7, smem_dst + offset + 8192 * 2);
-    }
-}
-
-__device__ __forceinline__ static void
-stmatrix_copy_tile(uint32_t *frag, half *smem_dst, int warpgroup_idx, int m, int n)
-{
-    int rep = 4; // epN / 16
-    int tid = threadIdx.x;
-    int warp_idx = canonical_warp_idx_sync() - 4 * warpgroup_idx; // second warp_idx offset
-    int row = tid % 16;
-    int col = (tid % 32) / 16;
-
-    auto frag_offset = frag + m * 64 + n * 16;
-
-#pragma unroll
-    for (int i = 0; i < rep; ++i)
-    {
-        int idx = i * 4;
-        uint32_t a0 = frag_offset[idx + 0];
-        uint32_t a1 = frag_offset[idx + 1];
-        uint32_t a2 = frag_offset[idx + 2];
-        uint32_t a3 = frag_offset[idx + 3];
-
-        int local_row = row * 64;
-        int local_col_sw = (col + i * 2) ^ (row % 8);
-        int offset = local_row + local_col_sw * 8 + warp_idx * 16 * 64;
-        stmatrix_atom(a0, a1, a2, a3, smem_dst + offset);
+        stmatrix_atom(a4, a5, a6, a7, smem_dst + offset + 8192);
     }
 }
 
 template <int bM, int bN, class T>
 __device__ __forceinline__ static void
-store(T *gC, T *shared_memory, int N, int warpgroup_idx)
+store_tile128(T *gC, T *shared_memory, int N, int warpgroup_idx, int ep_idx)
 {
     int tid = threadIdx.x;
-    int nbN = bN / 8; // float4 = 8 half, 32
-    int row_base = (tid - 128 * warpgroup_idx) / nbN;
-    int col = (tid - 128 * warpgroup_idx) % nbN;
+    int nbN = 16;                                     // float4 = 8 half
+    int row_base = (tid - 128 * warpgroup_idx) / nbN; // 8
+    int col = (tid - 128 * warpgroup_idx) % nbN;      // 16
 
 #pragma unroll
     for (int i = 0; i < 16; ++i)
     {
-        int col_sw1 = row_base ^ col;
-        int col_sw2 = (row_base + 4) ^ col; // 因为128个线程只能加载4行，不够8行，swizzle会有问题。
-        int row1 = row_base + i * 8;
-        int row2 = row_base + 4 + i * 8;
-        reinterpret_cast<float4 *>(gC + row1 * N)[col] = reinterpret_cast<float4 *>(shared_memory + row1 * bN)[col_sw1];
-        reinterpret_cast<float4 *>(gC + row2 * N)[col] = reinterpret_cast<float4 *>(shared_memory + row2 * bN)[col_sw2];
-    }
-}
-
-template <int bM, int bN, class T>
-__device__ __forceinline__ static void
-store_tile(T *gC, T *shared_memory, int N, int warpgroup_idx)
-{
-    int tid = threadIdx.x;
-    int nbN = 64 / 8; // float4 = 8 half, 8
-    int row_base = (tid - 128 * warpgroup_idx) / nbN; // 16
-    int col = (tid - 128 * warpgroup_idx) % nbN; // 8
-
-#pragma unroll
-    for (int i = 0; i < 4; ++i)
-    {
         int col_sw = (row_base % 8) ^ col;
-        int row = row_base + i * 16;
-        reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * 64)[col_sw];
+        int row = row_base + i * 8;
+        reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * 128)[col_sw];
     }
 }
 
@@ -701,9 +623,6 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
     constexpr int n_size = bN / 256;
     constexpr int k_size = bK / 16;
 
-    constexpr int ep_m_size = bM / epM; // 128 / 64 = 2
-    constexpr int ep_n_size = bN / epN; // 256 / 64 = 4
-
     // tma expect-tx bytes
     constexpr int tma_transaction_bytes = (bM * bK + bN * bK) * sizeof(T);
 
@@ -816,25 +735,15 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
 
             math_wg_order_barrier.wait();
 
+            // epilogue
             auto gC = C + x * bM * N + y * bN; // C is N-major
-            stmatrix_copy(reg_c, sC, warpgroup_idx);
+            stmatrix_copy_tile128(reg_c, sC, warpgroup_idx, 0);
             bar_sync(128, 0);
-            store<bM, bN, T>(gC, sC, N, warpgroup_idx);
-
-//             // epilogue TODO
-//             auto gC = C + x * bM * N + y * bN; // C is N-major
-// #pragma unroll 1
-//             for (int i = 0; i < ep_m_size; ++i)
-//             {
-// #pragma unroll 1
-//                 for (int j = 0; j < ep_n_size; ++j)
-//                 {
-//                     stmatrix_copy_tile(reg_c, sC, warpgroup_idx, i, j);
-//                     bar_sync(128, 0);
-//                     auto tile_gC = gC + i * epM * N + j * epN;
-//                     store_tile<bM, bN, T>(tile_gC, sC, N, warpgroup_idx);
-//                 }
-//             }
+            store_tile128<bM, bN, T>(gC, sC, N, warpgroup_idx, 0);
+            bar_sync(128, 1);
+            stmatrix_copy_tile128(reg_c, sC, warpgroup_idx, 1);
+            bar_sync(128, 2);
+            store_tile128<bM, bN, T>(gC + 128, sC, N, warpgroup_idx, 1);
 
             math_wg_order_barrier.arrive();
 
@@ -899,10 +808,10 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
     constexpr int blockM = 128;
     constexpr int blockN = 256;
     constexpr int blockK = 64;
-    constexpr int numPipe = 3;
+    constexpr int numPipe = 4;
 
     constexpr int epM = 128;
-    constexpr int epN = 256;
+    constexpr int epN = 128;
 
     using T = half;
     using TC = half;
@@ -940,6 +849,8 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
 
 /**
  * nvcc sm90_wgmma_tma_ws_pingpong.cu -O3 -arch=sm_90a -lcuda -lcublas -o sm90_wgmma_tma_ws_pingpong && ./sm90_wgmma_tma_ws_pingpong
+ * cublas time = 0.188707 ms, TFLPOS = 728.319817, mfu = 0.736420
+ * mma time = 0.175286 ms, TFLPOS = 784.083592, mfu = 0.795512
  */
 int main()
 {
