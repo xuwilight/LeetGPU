@@ -282,12 +282,12 @@ tma_copy_a(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, in
 #pragma unroll
     for (int i = 0; i < row; ++i)
     {
-        int crd1 = crd1_start + i * 8; // tma box [8, 64]
+        int crd1 = crd1_start + i * 128; // tma box [128, 64]
 #pragma unroll
         for (int j = 0; j < col; ++j)
         {
             int crd0 = crd0_start + j * 64;
-            int offset = (j * row + i) * 8 * 64;
+            int offset = (j * row + i) * 128 * 64;
             tma_load_2d(desc_ptr, mbar_ptr, static_cast<uint64_t>(cache_hint), smem_ptr + offset, crd0, crd1);
         }
     }
@@ -301,12 +301,12 @@ tma_copy_b(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, in
 #pragma unroll
     for (int i = 0; i < row; ++i)
     {
-        int crd1 = crd1_start + i * 8;
+        int crd1 = crd1_start + i * 64;
 #pragma unroll
         for (int j = 0; j < col; ++j)
         {
             int crd0 = crd0_start + j * 64;
-            int offset = (i + j * row) * 8 * 64;
+            int offset = (i + j * row) * 64 * 64;
             tma_load_2d(desc_ptr, mbar_ptr, static_cast<uint64_t>(cache_hint), smem_ptr + offset, crd0, crd1);
         }
     }
@@ -472,9 +472,9 @@ __global__ void __launch_bounds__(256, 1) wgmma_tma_kernel(const T *A, const T *
     __shared__ alignas(8) uint64_t producer_mbar[NumPipe];
     __shared__ alignas(8) uint64_t consumer_mbar[NumPipe];
 
-    constexpr int num_box_row_a = bM / 8;
+    constexpr int num_box_row_a = bM / 128;
     constexpr int num_box_col_a = bK / 64;
-    constexpr int num_box_row_b = bK / 8;
+    constexpr int num_box_row_b = bK / 64;
     constexpr int num_box_col_b = bN / 64;
 
     constexpr int m_size = bM / 64;
@@ -643,8 +643,8 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
     std::vector<int> gB_shape = {N, K}; // stride = {1, N}
 
     // tma copy box is 64×8 for half
-    std::vector<int> sA_shape = {64, 8}; // stride = {1, 64}
-    std::vector<int> sB_shape = {64, 8}; // stride = {1, 64}
+    std::vector<int> sA_shape = {64, 128}; // stride = {1, 64}
+    std::vector<int> sB_shape = {64, 64}; // stride = {1, 64}
 
     auto smem_swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
     auto tmaA_desc = make_gemm_tma_desc<T, 2>(const_cast<half *>(A), gA_shape, sA_shape, smem_swizzle);

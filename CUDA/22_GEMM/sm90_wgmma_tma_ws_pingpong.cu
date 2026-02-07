@@ -317,7 +317,7 @@ tma_copy_b(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, in
         for (int j = 0; j < col; ++j)
         {
             int crd0 = crd0_start + j * 64;
-            int offset = (i + j * row) * 8 * 64;
+            int offset = (i + j * row) * 64 * 64;
             tma_load_2d(desc_ptr, mbar_ptr, static_cast<uint64_t>(cache_hint), smem_ptr + offset, crd0, crd1);
         }
     }
@@ -614,9 +614,9 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
     PipelineState<NumPipe> write_state; // producer
     write_state.phase_ = 1;
 
-    constexpr int num_box_row_a = bM / 8;
+    constexpr int num_box_row_a = bM / 128;
     constexpr int num_box_col_a = bK / 64;
-    constexpr int num_box_row_b = bK / 8;
+    constexpr int num_box_row_b = bK / 64;
     constexpr int num_box_col_b = bN / 64;
 
     constexpr int m_size = bM / 64;
@@ -629,6 +629,9 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
     int num_k_tiles = (K + bK - 1) / bK;
     int num_m_tiles = (M + bM - 1) / bM;
     int num_n_tiles = (N + bN - 1) / bN;
+
+    num_m_tiles = num_m_tiles * (1 << base);
+    num_n_tiles = (num_n_tiles + (1 << base) - 1) / (1 << base);
     uint64_t total_tiles = (uint64_t)num_m_tiles * num_n_tiles;
     TileScheduler scheduler(num_m_tiles, total_tiles, 132); // 132 sm
 
@@ -664,6 +667,9 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
             {
                 auto x = work_tile_info.M_idx;
                 auto y = work_tile_info.N_idx;
+                y = (y << base) + (x & ((1 << base) - 1));
+                x = (x >> base);
+
                 auto k_tile_count = num_k_tiles;
 
                 int k_tile = 0;
@@ -697,6 +703,8 @@ __global__ void __launch_bounds__(384, 1) wgmma_tma_kernel(const T *A, const T *
         {
             auto x = work_tile_info.M_idx;
             auto y = work_tile_info.N_idx;
+            y = (y << base) + (x & ((1 << base) - 1));
+            x = (x >> base);
             auto k_tile_count = num_k_tiles;
 
             uint32_t reg_c[128] = {0};
@@ -817,20 +825,15 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
     using TC = half;
 
     constexpr int num_threads = 128 * 3; // one producer warpgroup, two consumer warpgroup
-    int num_blockM = (M + blockM - 1) / blockM;
-    int num_blockN = (N + blockN - 1) / blockN;
-
-    constexpr int base = 0;
-    num_blockM = num_blockM * (1 << base);
-    num_blockN = (num_blockN + (1 << base) - 1) / (1 << base);
+    constexpr int base = 2;
 
     // create tma desc
     std::vector<int> gA_shape = {K, M}; // stride = {1, K}
     std::vector<int> gB_shape = {N, K}; // stride = {1, N}
 
     // tma copy box is 64×8 for half
-    std::vector<int> sA_shape = {64, 8}; // stride = {1, 64}
-    std::vector<int> sB_shape = {64, 8}; // stride = {1, 64}
+    std::vector<int> sA_shape = {64, 128}; // stride = {1, 64}
+    std::vector<int> sB_shape = {64, 64}; // stride = {1, 64}
 
     auto smem_swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
     auto tmaA_desc = make_gemm_tma_desc<T, 2>(const_cast<half *>(A), gA_shape, sA_shape, smem_swizzle);

@@ -1,6 +1,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cuda.h>
+#include <random>
+#include <iostream>
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 #include <cuda_runtime.h>
@@ -25,7 +27,6 @@ __device__ int canonical_warp_idx_sync()
     return __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
 }
 
-// nvcc cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
 template <int bM, int bN, int bK, int NumThreads, class T, class TC, int NumPipe = 1, int base,
           class SmemLayoutA, class SmemLayoutB, class SmemLayoutC,
           class TmaA, class TmaB, class TmaC>
@@ -219,13 +220,15 @@ extern "C" void solve(half_t *A, half_t *B, half_t *C, int M, int N, int K, floa
     kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, tma_a, tma_b, tma_c);
 }
 
-// nvcc sm90_cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
-// cublas time = 0.178407 ms, TFLPOS = 770.367145, mfu = 0.778935
-// mma time = 0.189971 ms, TFLPOS = 723.473953, mfu = 0.731521
+// nvcc cute_wgmma.cu -O3 -arch=sm_90a -I ../../cutlass-4.1/include/ -I ../../cutlass-4.1/tools/util/include/ -lcuda -lcublas -o wgmma_tma --expt-relaxed-constexpr && ./wgmma_tma
+// cublas time = 0.189303 ms, TFLPOS = 726.027379, mfu = 0.734103
+// wgmma time = 0.191892 ms, TFLPOS = 716.228948, mfu = 0.724195
 int main()
 {
-    srand(1234);
-
+    float u = 1.0;
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-u, u);
+    
     int num = 4096;
 
     int M = num;
@@ -243,15 +246,15 @@ int main()
 
     for (int i = 0; i < M * K; ++i)
     {
-        h_A[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_A[i] = static_cast<T>(dis(gen));
     }
     for (int i = 0; i < N * K; ++i)
     {
-        h_B[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_B[i] = static_cast<T>(dis(gen));
     }
     for (int i = 0; i < N * K; ++i)
     {
-        h_C[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_C[i] = static_cast<T>(dis(gen));
     }
     thrust::device_vector<T> d_A = h_A;
     thrust::device_vector<T> d_B = h_B;
@@ -297,7 +300,7 @@ int main()
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);
-        run_benchmark(custom_func, "mma", flops, h100);
+        run_benchmark(custom_func, "wgmma", flops, h100);
     }
     return 0;
 }

@@ -223,7 +223,7 @@ __device__ __forceinline__ GmmaDescriptor make_wgmma_desc(void *smem_ptr, int si
 sA 的 layout 如下图所示，图中 sA 已经被 recast 成了 uint128 大小，只截取了前 16 行。
 
 <div align="center">
-    <img src="images/128BSW_desc.png" width="24%" height="auto" alt="swizzle"><br>
+    <img src="../images/128BSW_desc.png" width="24%" height="auto" alt="swizzle"><br>
     <small>k-major 128B swizzle tiling 128×64</small>
 </div>
 <br>
@@ -233,7 +233,7 @@ sA 的 layout 如下图所示，图中 sA 已经被 recast 成了 uint128 大小
 sB 的 layout 如下图所示，图中数据类型被 recast 成了 uint128，只截取了前 32 列。
 
 <div align="center">
-    <img src="images/mn_128BSW_desc.png" width="80%" height="auto" alt="swizzle"><br>
+    <img src="../images/mn_128BSW_desc.png" width="80%" height="auto" alt="swizzle"><br>
     <small>mn-major 128B swizzle tiling 128×64</small>
 </div>
 <br>

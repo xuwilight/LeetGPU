@@ -43,37 +43,6 @@ __device__ uint32_t elect_one_sync()
     return pred;
 }
 
-// // GMMA 64x128x16 F16+=F16*F16
-// template <int scale_D = 1, int scaleA = 1, int scaleB = 1, int tnspA = 0, int tnspB = 1>
-// __device__ static void
-// fma(uint64_t const &desc_a, uint64_t const &desc_b, uint32_t *c)
-// {
-//     asm volatile(
-//         "{\n"
-//         ".reg .pred p;\n"
-//         "setp.ne.b32 p, %34, 0;\n"
-//         "wgmma.mma_async.sync.aligned.m64n128k16.f16.f16.f16 "
-//         "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7,  "
-//         " %8,  %9,  %10, %11, %12, %13, %14, %15, "
-//         " %16, %17, %18, %19, %20, %21, %22, %23, "
-//         " %24, %25, %26, %27, %28, %29, %30, %31},"
-//         " %32,"
-//         " %33,"
-//         " p,   %35, %36, %37, %38;\n"
-//         "}\n"
-//         : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]),
-//           "+r"(c[4]), "+r"(c[5]), "+r"(c[6]), "+r"(c[7]),
-//           "+r"(c[8]), "+r"(c[9]), "+r"(c[10]), "+r"(c[11]),
-//           "+r"(c[12]), "+r"(c[13]), "+r"(c[14]), "+r"(c[15]),
-//           "+r"(c[16]), "+r"(c[17]), "+r"(c[18]), "+r"(c[19]),
-//           "+r"(c[20]), "+r"(c[21]), "+r"(c[22]), "+r"(c[23]),
-//           "+r"(c[24]), "+r"(c[25]), "+r"(c[26]), "+r"(c[27]),
-//           "+r"(c[28]), "+r"(c[29]), "+r"(c[30]), "+r"(c[31])
-//         : "l"(desc_a),
-//           "l"(desc_b),
-//           "r"(int32_t(scale_D)), "n"(int32_t(scaleA)), "n"(int32_t(scaleB)), "n"(int32_t(tnspA)), "n"(int32_t(tnspB)));
-// }
-
 // GMMA 64x128x16 F32+=F16*F16
 template <int scale_D = 1, int scaleA = 1, int scaleB = 1, int tnspA = 0, int tnspB = 1>
 __device__ static void
@@ -264,6 +233,23 @@ CUtensorMap make_gemm_tma_desc(void *gmem_tensor_ptr, std::vector<int> &gmem_sha
         tma_oobFill           // Any element that is outside of bounds will be set to zero by the TMA transfer.
     );
 
+    if (result != CUDA_SUCCESS)
+    {
+        std::cerr << "TMA Desc Addr:   " << &tensor_map
+                  << "\nformat         " << tma_format
+                  << "\ndim            " << RANK
+                  << "\ngmem_address   " << gmem_tensor_ptr
+                  << "\nglobalDim      " << gmem_prob_shape
+                  << "\nglobalStrides  " << gmem_prob_stride
+                  << "\nboxDim         " << smem_box_shape
+                  << "\nelementStrides " << smem_box_stride
+                  << "\ninterleave     " << tma_interleave
+                  << "\nswizzle        " << smem_swizzle
+                  << "\nl2Promotion    " << tma_l2Promotion
+                  << "\noobFill        " << tma_oobFill << std::endl;
+        std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
+        assert(false);
+    }
     return tensor_map;
 }
 
@@ -578,7 +564,7 @@ __global__ void wgmma_tma_kernel(const T *A, const T *B, TC *C, int M, int N, in
 #pragma unroll
         for (int i = 0; i < 8; ++i)
         {
-            float tmp = static_cast<float>(smem_half[i]) + static_cast<float>(c_old_half[i]); // alpha * val + beta * c
+            float tmp = static_cast<float>(smem_half[i]) * alpha + static_cast<float>(c_old_half[i]) * beta; // alpha * val + beta * c
             c_old_half[i] = static_cast<half>(tmp);
         }
         reinterpret_cast<float4 *>(gC + row * N)[col] = c_old;
@@ -676,8 +662,8 @@ extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K
 
 /**
  * nvcc sm90_wgmma_tma_accfp32.cu -O3 -arch=sm_90a -lcuda -lcublas -o sm90_wgmma_tma_accfp32 && ./sm90_wgmma_tma_accfp32
- * cublas time = 0.178304 ms, TFLPOS = 770.811070, mfu = 0.779384
- * mma time = 0.192716 ms, TFLPOS = 713.166569, mfu = 0.721099
+ * cublas time = 0.204830 ms, TFLPOS = 670.990191, mfu = 0.678453
+ * wgmma time = 0.203906 ms, TFLPOS = 674.031229, mfu = 0.681528
  */
 int main()
 {
@@ -763,7 +749,7 @@ int main()
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);
-        run_benchmark(custom_func, "mma", flops, h100);
+        run_benchmark(custom_func, "wgmma", flops, h100);
     }
     return 0;
 }

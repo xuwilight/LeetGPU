@@ -5,13 +5,8 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
+#include <random>
 #include "utils.h"
-
-__host__ __device__ void
-print1(half v)
-{
-    printf("%*.2f ", 2, float(v));
-}
 
 __device__ uint32_t cast_smem_ptr_to_uint(void const *const ptr)
 {
@@ -116,18 +111,18 @@ union GmmaDescriptor
     operator uint64_t() const noexcept { return desc_; }
 };
 
-__device__ GmmaDescriptor make_wgmma_desc(void *smem_ptr, int siwzzle_type, int sbo, int lbo)
+__device__ __forceinline__ GmmaDescriptor make_wgmma_desc(void *smem_ptr, int siwzzle_type, int sbo, int lbo)
 {
     GmmaDescriptor desc;
-    desc.bitfield.layout_type_ = siwzzle_type; // swizzle type
+    desc.bitfield.layout_type_ = siwzzle_type;
     desc.bitfield.start_address_ = static_cast<uint16_t>(cast_smem_ptr_to_uint(smem_ptr) >> 4);
     desc.bitfield.base_offset_ = 0;
-    desc.bitfield.stride_byte_offset_ = sbo;  // SBO
-    desc.bitfield.leading_byte_offset_ = lbo; // LBO
+    desc.bitfield.stride_byte_offset_ = sbo;
+    desc.bitfield.leading_byte_offset_ = lbo;
     return desc;
 }
 
-__device__ static GmmaDescriptor gemm_desc_offset(GmmaDescriptor &desc_, int offset)
+__device__ __forceinline__ static GmmaDescriptor gemm_desc_offset(GmmaDescriptor &desc_, int offset)
 {
     GmmaDescriptor ret;
     ret.reg32_[0] = desc_.reg32_[0] + uint32_t(offset);
@@ -135,10 +130,9 @@ __device__ static GmmaDescriptor gemm_desc_offset(GmmaDescriptor &desc_, int off
     return ret;
 }
 
-__device__ static void
+__device__ __forceinline__ static void
 gemm(int M, int N, int K, GmmaDescriptor &desc_a, GmmaDescriptor &desc_b, uint32_t *reg_c, int stage)
 {
-    // TODO: serpentine iteration
 #pragma unroll
     for (int i = 0; i < M; ++i)
     {
@@ -148,9 +142,9 @@ gemm(int M, int N, int K, GmmaDescriptor &desc_a, GmmaDescriptor &desc_b, uint32
 #pragma unroll
             for (int k = 0; k < K; ++k)
             {
-                // update desc_a desc_b ptr
-                int offset_a = i * 64 + k * 256 + stage * (256 * K);
-                int offset_b = j * 128 + k * 256 + stage * (256 * K);
+                // int is = (j & 1) ? M - 1 - i : i; // Serpentine coordinate
+                int offset_a = i * 512 + k * 2 + stage * 1024;
+                int offset_b = j * 512 + k * 128 + stage * 1024; // j is always 0
                 auto desc_a_offset = gemm_desc_offset(desc_a, offset_a);
                 auto desc_b_offset = gemm_desc_offset(desc_b, offset_b);
                 fma(desc_a_offset.desc_, desc_b_offset.desc_, reg_c + i * 32);
@@ -206,7 +200,7 @@ CUtensorMap make_gemm_tma_desc(void *gmem_tensor_ptr, std::vector<int> &gmem_sha
     auto smem_swizzle = swizzle;
     auto tma_format = CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
     auto tma_interleave = CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE;
-    auto tma_l2Promotion = CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B; // tune
+    auto tma_l2Promotion = CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
     auto tma_oobFill = CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
 
     // Create the tensor descriptor.
@@ -225,24 +219,6 @@ CUtensorMap make_gemm_tma_desc(void *gmem_tensor_ptr, std::vector<int> &gmem_sha
         tma_oobFill           // Any element that is outside of bounds will be set to zero by the TMA transfer.
     );
 
-    if (result != CUDA_SUCCESS)
-    {
-        std::cerr << "TMA Desc Addr:   " << &tensor_map
-                  << "\nformat         " << tma_format
-                  << "\ndim            " << RANK
-                  << "\ngmem_address   " << gmem_tensor_ptr
-                  << "\nglobalDim      " << gmem_prob_shape
-                  << "\nglobalStrides  " << gmem_prob_stride
-                  << "\nboxDim         " << smem_box_shape
-                  << "\nelementStrides " << smem_box_stride
-                  << "\ninterleave     " << tma_interleave
-                  << "\nswizzle        " << smem_swizzle
-                  << "\nl2Promotion    " << tma_l2Promotion
-                  << "\noobFill        " << tma_oobFill << std::endl;
-        std::cerr << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
-        assert(false);
-    }
-
     return tensor_map;
 }
 
@@ -253,7 +229,7 @@ enum class CacheHintSm90 : uint64_t
     EVICT_LAST = 0x14F0000000000000,
 };
 
-__device__ static void
+__device__ __forceinline__ static void
 tma_load_2d(void const *desc_ptr, uint64_t *mbar_ptr, uint64_t cache_hint, void *smem_ptr,
             int32_t const &crd0, int32_t const &crd1)
 {
@@ -269,20 +245,7 @@ tma_load_2d(void const *desc_ptr, uint64_t *mbar_ptr, uint64_t cache_hint, void 
         : "memory");
 }
 
-// __device__ static void
-// tma_store_2d(void const *desc_ptr, void const *smem_ptr, int32_t const &crd0, int32_t const &crd1)
-// {
-//     uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
-//     uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
-//     asm volatile(
-//         "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group [%0, {%2, %3}], [%1];"
-//         :
-//         : "l"(gmem_int_desc), "r"(smem_int_ptr),
-//           "r"(crd0), "r"(crd1)
-//         : "memory");
-// }
-
-__device__ static void
+__device__ __forceinline__ static void
 tma_copy_a(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, int col, int crd0_start, int crd1_start)
 {
     auto cache_hint = CacheHintSm90::EVICT_NORMAL;
@@ -290,18 +253,18 @@ tma_copy_a(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, in
 #pragma unroll
     for (int i = 0; i < row; ++i)
     {
-        int crd1 = crd1_start + i * 8; // tma box
+        int crd1 = crd1_start + i * 8; // tma box [8, 64]
 #pragma unroll
         for (int j = 0; j < col; ++j)
         {
-            int crd0 = crd0_start + j * 8;
-            int offset = (j * row + i) * 8 * 8; // half offset, 注意 smem 指针类型
+            int crd0 = crd0_start + j * 64;
+            int offset = (j * row + i) * 8 * 64;
             tma_load_2d(desc_ptr, mbar_ptr, static_cast<uint64_t>(cache_hint), smem_ptr + offset, crd0, crd1);
         }
     }
 }
 
-__device__ static void
+__device__ __forceinline__ static void
 tma_copy_b(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, int col, int crd0_start, int crd1_start)
 {
     auto cache_hint = CacheHintSm90::EVICT_NORMAL;
@@ -313,45 +276,12 @@ tma_copy_b(void const *desc_ptr, uint64_t *mbar_ptr, half *smem_ptr, int row, in
 #pragma unroll
         for (int j = 0; j < col; ++j)
         {
-            int crd0 = crd0_start + j * 8;
-            int offset = (i * col + j) * 8 * 8;
+            int crd0 = crd0_start + j * 64;
+            int offset = (i + j * row) * 8 * 64;
             tma_load_2d(desc_ptr, mbar_ptr, static_cast<uint64_t>(cache_hint), smem_ptr + offset, crd0, crd1);
         }
     }
 }
-
-// __device__ static void
-// tma_copy_c(void const *desc_ptr, half *smem_ptr, int row, int col, int crd0_start, int crd1_start)
-// {
-// #pragma unroll
-//     for (int i = 0; i < row; ++i)
-//     {
-//         int crd1 = crd1_start + i * 8;
-// #pragma unroll
-//         for (int j = 0; j < col; ++j)
-//         {
-//             int crd0 = crd0_start + j * 8;
-//             int offset = (j * row + i) * 8 * 8;
-//             tma_store_2d(desc_ptr, smem_ptr + offset, crd0, crd1); // Do we need swizzle when save?
-//         }
-//     }
-// }
-
-// __device__ static void tma_store_fence()
-// {
-//     asm volatile("fence.proxy.async.shared::cta;");
-// }
-
-// __device__ static void tma_store_arrive()
-// {
-//     asm volatile("cp.async.bulk.commit_group;");
-// }
-
-// template <int Count>
-// __device__ static void tma_store_wait()
-// {
-//     asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(Count) : "memory");
-// }
 
 // mbarrier
 __device__ static void mbarrier_init(uint64_t const *smem_ptr, uint32_t arrive_count)
@@ -413,7 +343,7 @@ stmatrix_atom(uint32_t const &src0, uint32_t const &src1, uint32_t const &src2, 
                  "r"(src0), "r"(src1), "r"(src2), "r"(src3));
 }
 
-__device__ static void
+__device__ __forceinline__ static void
 stmatrix_copy(uint32_t *frag, half *smem_dst)
 {
     int rep = 8;
@@ -434,7 +364,11 @@ stmatrix_copy(uint32_t *frag, half *smem_dst)
         uint32_t a5 = frag[i * 4 + 1 + 32];
         uint32_t a6 = frag[i * 4 + 2 + 32];
         uint32_t a7 = frag[i * 4 + 3 + 32];
-        int offset = row * 128 + (col + i * 2) * 8 + warp_idx * 16 * 128;
+
+        int local_row = row * 128;
+        int local_col_sw = (col + i * 2) ^ (row % 8);
+        int offset = local_row + local_col_sw * 8 + warp_idx * 16 * 128;
+
         stmatrix_atom(a0, a1, a2, a3, smem_dst + offset);
         stmatrix_atom(a4, a5, a6, a7, smem_dst + offset + 8192);
     }
@@ -458,13 +392,12 @@ struct PipelineState
 };
 
 template <int bM, int bN, int bK, int NumThreads, class T, class TC, int NumPipe = 1, int base = 0,
-          class tmaA, class tmaB, class tmaC>
-__global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
-                                 const __grid_constant__ tmaA tma_a,
-                                 const __grid_constant__ tmaB tma_b,
-                                 const __grid_constant__ tmaC tma_c)
+          class tmaA, class tmaB>
+__global__ void __launch_bounds__(128, 1)
+    wgmma_tma_kernel(const T *A, const T *B, TC *C, int M, int N, int K, float alpha, float beta,
+                     const __grid_constant__ tmaA tma_a,
+                     const __grid_constant__ tmaB tma_b)
 {
-    // const int tid = threadIdx.x;
     int warp_idx = canonical_warp_idx_sync();
     int lane_predicate = elect_one_sync();
 
@@ -482,14 +415,12 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
     __shared__ alignas(8) uint64_t producer_mbar[NumPipe];
     __shared__ alignas(8) uint64_t consumer_mbar[NumPipe];
 
-    auto gA = A + x * bM * K;          // A is K-major
-    auto gB = B + y * bN;              // B is N-major
     auto gC = C + x * bM * N + y * bN; // C is N-major
 
-    constexpr int num_box_row_a = bM / 8;
-    constexpr int num_box_col_a = bK / 8;
-    constexpr int num_box_row_b = bK / 8;
-    constexpr int num_box_col_b = bN / 8;
+    constexpr int num_tma_row_a = bM / 8;
+    constexpr int num_tma_col_a = bK / 64;
+    constexpr int num_tma_row_b = bK / 8;
+    constexpr int num_tma_col_b = bN / 64;
 
     constexpr int m_size = bM / 64;
     constexpr int n_size = bN / 128;
@@ -497,14 +428,13 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
 
     uint32_t reg_c[64] = {0};
 
-    auto wgmma_desc_a = make_wgmma_desc(sA, 0 /*swizzle type*/, 8 /*sbo*/, 128 /*lbo*/); // none swizzle
-    auto wgmma_desc_b = make_wgmma_desc(sB, 0 /*swizzle type*/, 8 /*sbo*/, 128 /*lbo*/); // none swizzle
+    auto wgmma_desc_a = make_wgmma_desc(sA, 1 /*swizzle type*/, 64 /*sbo*/, 1 /*lbo*/);   // 128B swizzle
+    auto wgmma_desc_b = make_wgmma_desc(sB, 1 /*swizzle type*/, 64 /*sbo*/, 512 /*lbo*/); // 128B swizzle
 
     // tma expect-tx bytes
     constexpr int tma_transaction_bytes = (bM * bK + bN * bK) * sizeof(T);
 
-    int numK = (K + bK - 1) / bK;
-    int k_tile_count = numK;
+    int k_tile_count = (K + bK - 1) / bK;
     int k_tile = 0;
 
 #pragma unroll
@@ -528,8 +458,8 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
         if (warp_idx == 0 && lane_predicate == 1)
         {
             arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-            tma_copy_a(&tma_a, &producer_mbar[pipe], tile_sA, num_box_row_a, num_box_col_a, k_tile * bK, x * bM);
-            tma_copy_b(&tma_b, &producer_mbar[pipe], tile_sB, num_box_row_b, num_box_col_b, y * bN, k_tile * bK);
+            tma_copy_a(&tma_a, &producer_mbar[pipe], tile_sA, num_tma_row_a, num_tma_col_a, k_tile * bK, x * bM);
+            tma_copy_b(&tma_b, &producer_mbar[pipe], tile_sB, num_tma_row_b, num_tma_col_b, y * bN, k_tile * bK);
         }
         ++k_tile;
     }
@@ -537,6 +467,7 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
     PipelineState<NumPipe> read_state;
     PipelineState<NumPipe> write_state;
 
+#pragma unroll
     for (int pipe = 0; pipe < NumPipe - 1; ++pipe)
     {
         mbarrier_wait(&producer_mbar[pipe], read_state.phase_);
@@ -548,33 +479,19 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
         mbarrier_arrive(&consumer_mbar[pipe]);
     }
 
-    // if (blockIdx.x == 1 && blockIdx.y == 0 && threadIdx.x == 0)
-    // {
-    //     for (int i = 0; i < bN; ++i)
-    //     {
-    //         printf("--");
-    //         for (int j = 0; j < bK; ++j)
-    //         {
-    //             print1(*(sA + i * bK + j));
-    //         }
-    //         printf("\n");
-    //     }
-    // }
-
     while (k_tile <= k_tile_count)
     {
         warpgroup_wait<1>();
         if (warp_idx == 0 && lane_predicate == 1 && k_tile < k_tile_count)
         {
             int pipe = write_state.index_;
-
             auto tile_sA = sA + pipe * bM * bK;
             auto tile_sB = sB + pipe * bN * bK;
 
             mbarrier_wait(&consumer_mbar[pipe], write_state.phase_);
             arrive_and_expect_tx(&producer_mbar[pipe], tma_transaction_bytes);
-            tma_copy_a(&tma_a, &producer_mbar[pipe], tile_sA, num_box_row_a, num_box_col_a, k_tile * bK, x * bM);
-            tma_copy_b(&tma_b, &producer_mbar[pipe], tile_sB, num_box_row_b, num_box_col_b, y * bN, k_tile * bK);
+            tma_copy_a(&tma_a, &producer_mbar[pipe], tile_sA, num_tma_row_a, num_tma_col_a, k_tile * bK, x * bM);
+            tma_copy_b(&tma_b, &producer_mbar[pipe], tile_sB, num_tma_row_b, num_tma_col_b, y * bN, k_tile * bK);
             ++write_state;
         }
         int read_pipe = read_state.index_;
@@ -589,61 +506,75 @@ __global__ void wgmma_tma_kernel(T *A, T *B, TC *C, int M, int N, int K,
     }
 
     warpgroup_wait<0>();
-    // __syncthreads();
-    // if (blockIdx.x == 1 && blockIdx.y == 1 && threadIdx.x == 0)
-    // {
-    //     for (int i = 0; i < bN; ++i)
-    //     {
-    //         printf("--");
-    //         for (int j = 0; j < bK; ++j)
-    //         {
-    //             print1(*(sA + i * bK + j));
-    //         }
-    //         printf("\n");
-    //     }
-    // }
-    // __syncthreads();
-
-    // if (blockIdx.x == 0 && blockIdx.y == 1 && threadIdx.x == 4)
-    // {
-    //     for (int i = 0; i < 64; ++i)
-    //     {
-    //         for (int j = 0; j < 2; ++j)
-    //         {
-    //             print1(reinterpret_cast<half*>(reg_c)[i + j * 64]);
-    //         }
-    //         printf("\n");
-    //     }
-    //     printf("\n");
-    // }
-    // __syncthreads();
 
     stmatrix_copy(reg_c, shared_memory);
-
-    // tma_store_fence();
     __syncthreads();
 
-    // // store shared memory to global memory
-    // if (warp_idx == 0 && lane_predicate == 1)
-    // {
-    //     tma_copy_c(&tma_c, shared_memory, 16, 16, y * bN, x * bM); // update box size
-    //     tma_store_arrive();
-    //     tma_store_wait<0>();
-    // }
-    int n_tid_col = bN / 8; // use float4
+    int nbN = bN / 8; // float4 = 8 half
+    int row_base = threadIdx.x / nbN;
+    int col = threadIdx.x % nbN;
+    int col_sw = row_base ^ col;
 #pragma unroll
-    for (int i = threadIdx.x; i < bM * n_tid_col; i += NumThreads)
+    for (int i = 0; i < 16; ++i) // 128 / (128tid / 16)
     {
-        int row = i / n_tid_col;
-        int col = i % n_tid_col;
-        reinterpret_cast<float4 *>(gC + row * N)[col] = reinterpret_cast<float4 *>(shared_memory + row * bN)[col];
+        int row = row_base + i * 8;
+        float4 smem_vec = reinterpret_cast<float4 *>(shared_memory + row * bN)[col_sw];
+        reinterpret_cast<float4 *>(gC + row * N)[col] = smem_vec;
+    }
+}
+
+template <int bM, int bN, int bK, int NumThreads, class T, int NumPipe = 1>
+__global__ void gemm_base(const T *A, const T *B, T *C, int M, int N, int K, float alpha, float beta)
+{
+    const int x = blockIdx.x;
+    const int y = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    constexpr int m_tid = 16;         // 16 threads in M
+    constexpr int n_tid = 8;          //  8 threads in N
+    constexpr int m_val = bM / m_tid; //  8 per thread in M
+    constexpr int n_val = bN / n_tid; // 16 per thread in N
+
+    auto gA = A + x * bM * K;          // A is K-major
+    auto gB = B + y * bN;              // B is N-major
+    auto gC = C + x * bM * N + y * bN; // C is N-major
+
+    int row_offset = tid / n_tid * m_val;
+    int col_offset = tid % n_tid * n_val;
+
+#pragma unroll
+    for (int i = 0; i < m_val; ++i)
+    {
+        int row_in_block = row_offset + i;
+        int global_row = x * bM + row_in_block;
+        auto tA = gA + row_in_block * K;
+#pragma unroll
+        for (int j = 0; j < n_val; ++j)
+        {
+            int col_in_block = col_offset + j;
+            int global_col = y * bN + col_in_block;
+
+            if (global_row >= M || global_col >= N)
+            {
+                continue;
+            }
+            auto tC = gC + row_in_block * N + col_in_block;
+            float ori_val = static_cast<float>(tC[0]);
+            float val_c = 0.0f;
+            auto b_ptr = gB + col_in_block;
+
+            for (int k = 0; k < K; ++k)
+            {
+                val_c += static_cast<float>(tA[k] * b_ptr[k * N]);
+            }
+            tC[0] = static_cast<T>(val_c * alpha + beta * ori_val);
+        }
     }
 }
 
 // A, B, and C are device pointers
-extern "C" void solve(half *A, half *B, half *C, int M, int N, int K, float alpha, float beta)
+extern "C" void solve(const half *A, const half *B, half *C, int M, int N, int K, float alpha, float beta)
 {
-
     constexpr int blockM = 128;
     constexpr int blockN = 128;
     constexpr int blockK = 64;
@@ -656,40 +587,41 @@ extern "C" void solve(half *A, half *B, half *C, int M, int N, int K, float alph
     int num_blockM = (M + blockM - 1) / blockM;
     int num_blockN = (N + blockN - 1) / blockN;
 
-    constexpr int base = 0;
+    constexpr int base = 2;
     num_blockM = num_blockM * (1 << base);
     num_blockN = (num_blockN + (1 << base) - 1) / (1 << base);
 
     // create tma desc
     std::vector<int> gA_shape = {K, M}; // stride = {1, K}
     std::vector<int> gB_shape = {N, K}; // stride = {1, N}
-    std::vector<int> gC_shape = {N, M}; // stride = {1, N}
 
     // tma copy box is 64×8 for half
-    std::vector<int> sA_shape = {8, 8}; // stride = {1, 64}
-    std::vector<int> sB_shape = {8, 8}; // stride = {1, 64}
-    std::vector<int> sC_shape = {8, 8}; // stride = {1, 64}
+    std::vector<int> sA_shape = {64, 8}; // stride = {1, 64}
+    std::vector<int> sB_shape = {64, 8}; // stride = {1, 64}
 
-    auto smem_swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE; // no swizzle for validate
-    auto tmaA_desc = make_gemm_tma_desc<T, 2>(A, gA_shape, sA_shape, smem_swizzle);
-    auto tmaB_desc = make_gemm_tma_desc<T, 2>(B, gB_shape, sB_shape, smem_swizzle);
-    auto tmaC_desc = make_gemm_tma_desc<T, 2>(C, gC_shape, sC_shape, smem_swizzle);
+    auto smem_swizzle = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B;
+    auto tmaA_desc = make_gemm_tma_desc<T, 2>(const_cast<half *>(A), gA_shape, sA_shape, smem_swizzle);
+    auto tmaB_desc = make_gemm_tma_desc<T, 2>(const_cast<half *>(B), gB_shape, sB_shape, smem_swizzle);
 
     dim3 block(num_threads);
     dim3 grid(num_blockM, num_blockN);
     int smem_size = int(sizeof(T) * ((blockM + blockN) * blockK * numPipe));
     auto kernel_fptr = wgmma_tma_kernel<blockM, blockN, blockK, num_threads, T, TC, numPipe, base,
-                                        decltype(tmaA_desc), decltype(tmaB_desc), decltype(tmaC_desc)>;
+                                        decltype(tmaA_desc), decltype(tmaB_desc)>;
     cudaFuncSetAttribute(kernel_fptr, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, tmaA_desc, tmaB_desc, tmaC_desc);
+    kernel_fptr<<<grid, block, smem_size>>>(A, B, C, M, N, K, alpha, beta, tmaA_desc, tmaB_desc);
 }
 
-// nvcc sm90_wgmma_tma_noswizzle.cu -O3 -arch=sm_90a -lcuda -lcublas -o wgmma_tma_noswizzle && ./wgmma_tma_noswizzle
-// cublas time = 0.178500 ms, TFLPOS = 769.964089, mfu = 0.778528
-// mma time = 0.880120 ms, TFLPOS = 156.159307, mfu = 0.157896
+/**
+ * nvcc sm90_wgmma_tma.cu -O3 -arch=sm_90a -lcuda -lcublas -o sm90_wgmma_tma && ./sm90_wgmma_tma
+ * cublas time = 0.187863 ms, TFLPOS = 731.591240, mfu = 0.739728
+ * wgmma time = 0.191982 ms, TFLPOS = 715.895551, mfu = 0.723858
+ */
 int main()
 {
-    srand(1234);
+    float u = 1.0;
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> dis(-u, u);
 
     int num = 4096;
 
@@ -708,17 +640,16 @@ int main()
 
     for (int i = 0; i < M * K; ++i)
     {
-        h_A[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_A[i] = static_cast<T>(dis(gen));
     }
     for (int i = 0; i < N * K; ++i)
     {
-        h_B[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_B[i] = static_cast<T>(dis(gen));
     }
     for (int i = 0; i < N * K; ++i)
     {
-        h_C[i] = static_cast<T>(rand() % 9 * 1.0 / 10);
+        h_C[i] = static_cast<T>(dis(gen));
     }
-
     thrust::device_vector<T> d_A = h_A;
     thrust::device_vector<T> d_B = h_B;
     thrust::device_vector<TC> d_C1 = h_C;
@@ -728,12 +659,19 @@ int main()
     cublasCreate(&handle);
     const __half alpha = 1.0f, beta = 0.0f;
     // C is column-major
+    // cublasHgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, M, N, K,
+    //             reinterpret_cast<const __half *>(&alpha),
+    //             reinterpret_cast<__half *>(d_A.data().get()), K,
+    //             reinterpret_cast<__half *>(d_B.data().get()), N,
+    //             reinterpret_cast<const __half *>(&beta),
+    //             reinterpret_cast<__half *>(d_C1.data().get()), M);
     cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha,
                  reinterpret_cast<__half *>(d_B.data().get()), CUDA_R_16F, N,
                  reinterpret_cast<__half *>(d_A.data().get()), CUDA_R_16F, K,
                  &beta,
                  reinterpret_cast<__half *>(d_C1.data().get()), CUDA_R_16F, N,
                  CUDA_R_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
     ref_res = d_C1;
 
     solve(d_A.data().get(), d_B.data().get(), d_C2.data().get(), M, N, K, 1.0f, 0.0f);
@@ -763,7 +701,7 @@ int main()
         };
 
         run_benchmark(cublas_func, "cublas", flops, h100);
-        run_benchmark(custom_func, "mma", flops, h100);
+        run_benchmark(custom_func, "wgmma", flops, h100);
     }
     return 0;
 }
