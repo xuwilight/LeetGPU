@@ -1,10 +1,10 @@
 # sm90_wgmma_tma
 
-使用 tma 和 wgmma 实现一个矩阵乘。
+本文将使用 tma 和 wgmma 在 Hopper 架构（H200）上实现一个高性能的矩阵乘。
 
-前置知识：`cp.async.bulk` 指令，`mbarrier` 指令，`wgmma` 指令。
+前置知识：[`cp.async.bulk`](https://github.com/xuwilight/PTX-Notes/blob/main/docs/cp.async.md) 指令，[`mbarrier`](https://github.com/xuwilight/PTX-Notes/blob/main/docs/mbarrier.md) 指令，[`wgmma`](https://github.com/xuwilight/PTX-Notes/blob/main/docs/wgmma.md) 指令。
 
-tma 使用的就是 `cp.async.bulk` 指令，用于拷贝数据。
+tma 使用的是 `cp.async.bulk` 指令，用于拷贝数据。
 
 `mbarrier` 用于同步流水线。
 
